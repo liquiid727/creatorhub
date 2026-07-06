@@ -238,7 +238,8 @@ _NAME_KEYS = ("nickname", "nick_name", "user_name", "userName", "name", "nick", 
 _ID_KEYS = ("user_id", "userId", "uid", "id", "red_id", "kwaiId")
 # 「强用户特征」字段:webpack 模块清单 {id,name} 没有这些,用来把模块/无关对象剔掉
 _STRONG_ID_KEYS = ("user_id", "userId", "uid", "sec_uid", "secUid", "red_id", "kwaiId")
-_AVATAR_KEYS = ("avatar", "avatar_thumb", "avatarUrl", "avatar_url", "headurl",
+_AVATAR_KEYS = ("avatar", "avatar_thumb", "avatar_small", "avatar_larger",
+                "avatarUrl", "avatar_url", "headurl",
                 "head_url", "headUrl", "image", "images", "icon")
 
 
@@ -798,6 +799,53 @@ def _harvest_users(data, into: Dict[str, dict]) -> None:
             stack.extend(cur)
 
 
+async def _douyin_cookie_str(mgr: BrowserManager, identity) -> str:
+    """从账号常驻 context 取 douyin.com 的 cookie 串(给 WS/直连用)。"""
+    ctx = await mgr.context_for(identity)
+    cks = await ctx.cookies("https://www.douyin.com")
+    return "; ".join(f"{c['name']}={c['value']}" for c in cks)
+
+
+async def _fetch_im_user_info(page, sec_ids: list) -> Dict[str, dict]:
+    """在 douyin 页面内批量 POST /aweme/v1/web/im/user/info/(body sec_user_ids=[...]),
+    抖音自己的 fetch 拦截器会补 a_bogus 签名。返回 sec_uid -> {nickname, avatar, sec_uid}。"""
+    ids = list(dict.fromkeys([s for s in sec_ids if s]))   # 去重
+    if not ids:
+        return {}
+    try:
+        data = await page.evaluate(
+            """async (ids) => {
+              const out = [];
+              for (let i=0; i<ids.length; i+=20) {
+                const chunk = ids.slice(i, i+20);
+                const body = 'sec_user_ids=' + encodeURIComponent(JSON.stringify(chunk));
+                try {
+                  const r = await fetch('/aweme/v1/web/im/user/info/', {
+                    method:'POST', credentials:'include',
+                    headers:{'content-type':'application/x-www-form-urlencoded'}, body});
+                  const j = await r.json();
+                  if (j && Array.isArray(j.data)) out.push(...j.data);
+                } catch (e) {}
+              }
+              return out;
+            }""", ids)
+    except Exception as e:
+        print(f"[dm-userinfo] in-page fetch failed: {e!r}")
+        return {}
+    prof: Dict[str, dict] = {}
+    for u in (data or []):
+        if not isinstance(u, dict):
+            continue
+        sec = str(u.get("sec_uid") or u.get("secUid") or "")
+        if not sec:
+            continue
+        nick = str(u.get("nickname") or u.get("alias_nickname") or "")
+        avatar = _avatar_of(u)
+        prof[sec] = {"nickname": nick, "avatar": avatar, "sec_uid": sec}
+    print(f"[dm-userinfo] batch fetched {len(prof)}/{len(ids)} profiles")
+    return prof
+
+
 async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                                  settle_ms: int = 2600, max_scrolls: int = 8
                                  ) -> Tuple[List[dict], str]:
@@ -816,8 +864,6 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
     im_hit = [False]             # IM 是否真的 bootstrap(点入口后据此确认,而非只看「点了」)
     dm_init_raw = [b""]          # 抖音:get_message_by_init 的 protobuf 大包(会话全在这)
     im_profiles: Dict[str, dict] = {}  # uid -> {nickname, avatar, sec_uid},来自 im/user/info JSON
-    dm_userinfo_probe: list = []  # 标定:im/user/info 的请求 URL query + 响应结构
-    dm_msg_bodies: Dict[str, bytes] = {}  # 标定:各 /v1/message|stranger 接口的 protobuf body(留最大)
     error = ""
     page = await mgr.new_page(identity, block_media=True)
 
@@ -859,15 +905,6 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                 b = b""
             if len(b) > len(dm_init_raw[0]):
                 dm_init_raw[0] = b
-        # 标定:各私信消息接口的 protobuf body(留每 path 最大),用来找「打开会话」触发的历史接口
-        if platform == "douyin" and ("/v1/message/" in low or "/v1/stranger/" in low):
-            try:
-                b = await resp.body()
-            except Exception:
-                b = b""
-            key = low.rsplit("/", 1)[-1] or low
-            if len(b) > len(dm_msg_bodies.get(key, b"")):
-                dm_msg_bodies[key] = b
         # 私信接口可能是 protobuf:先取文本,JSON 解析失败也留个样本(标注 non-json)
         raw_text = ""
         try:
@@ -882,11 +919,6 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
         if platform == "douyin" and "/aweme/v1/web/im/user/info/" in low \
                 and data is not None:
             _harvest_users(data, im_profiles)
-            # 标定:抓一次完整请求 URL + 顶层结构,用来写「按 uid 批量补资料」
-            if len(dm_userinfo_probe) < 2:
-                q = u.split("?", 1)[1] if "?" in u else ""
-                top = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-                dm_userinfo_probe.append(f"q={q[:300]} | top={top}")
         # 小红书 message/entry 的 visible 决定网页端私信是否开放(false=未开放,仅 App)
         if "/api/im/web/message/entry" in low and isinstance(data, dict):
             v = (data.get("data") or {}).get("visible")
@@ -1076,13 +1108,19 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
             await page.wait_for_timeout(settle_ms)
             if len(collected) == before:
                 break
-        # 抖音:会话在 get_message_by_init 的 protobuf 大包里,解出会话 + 用 im/user/info
-        # 采到的 uid->资料 水合昵称/头像。(会话面板不在 DOM 里可靠渲染,故不走 DOM 抓取)
+        # 抖音:会话在 get_message_by_init 的 protobuf 大包里。解会话 → 页面内批量
+        # POST im/user/info(按 sec_uid,抖音自己签名)补昵称/头像 → 水合。
         if platform == "douyin" and dm_init_raw[0]:
             try:
-                for c in parse_conversations(dm_init_raw[0]):
-                    prof = im_profiles.get(c["peer_uid"], {})
-                    # 最后一条消息元信息塞进 raw_json(模型已有列),sync_dm 据此落 DmMessage
+                convs_parsed = parse_conversations(dm_init_raw[0])
+                # 页面内批量拉资料(sec_uid),补全 im/user/info 自然加载没覆盖到的
+                sec_ids = [c["peer_sec_uid"] for c in convs_parsed
+                           if c.get("peer_sec_uid")
+                           and not im_profiles.get(c["peer_uid"])]
+                sec_profiles = await _fetch_im_user_info(page, sec_ids)
+                for c in convs_parsed:
+                    prof = im_profiles.get(c["peer_uid"]) \
+                        or sec_profiles.get(c["peer_sec_uid"]) or {}
                     last_meta = json.dumps({
                         "last_sender_uid": c["last_sender_uid"],
                         "self_uid": c["self_uid"],
@@ -1095,7 +1133,7 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                         "peer_nickname": prof.get("nickname", ""),
                         "peer_avatar": prof.get("avatar", ""),
                         "last_text": c["last_text"],
-                        "last_time": 0,
+                        "last_time": c.get("last_time") or 0,
                         "unread_count": 0,
                         "conv_short_id": c["conv_short_id"],
                         "ticket": c["ticket"],
@@ -1103,70 +1141,10 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                     }
                 _named = sum(1 for v in collected.values() if v["peer_nickname"])
                 print(f"[dm-pb] douyin parsed={len(collected)} "
-                      f"init_bytes={len(dm_init_raw[0])} profiles={len(im_profiles)} "
+                      f"im_profiles={len(im_profiles)} sec_profiles={len(sec_profiles)} "
                       f"named={_named}")
-                for i, pr in enumerate(dm_userinfo_probe):
-                    print(f"[dm-userinfo {i}] {pr}")
             except Exception as e:
                 print(f"[dm-pb] douyin protobuf parse failed: {e!r}")
-
-        # 标定(临时):私信面板疑似在 vmok 微前端 iframe 里(api_seen 有 pcim_saas_vmok)。
-        # 枚举所有 frame + 各自会话行数,找到承载面板的 frame,再在其中点会话触发历史接口。
-        if platform == "douyin" and im_hit[0]:
-            try:
-                frames = page.frames
-                fr_report = []
-                target_fr = None
-                for fr in frames:
-                    try:
-                        info = await fr.evaluate(
-                            "() => { const imgs=[...document.querySelectorAll('img')]"
-                            ".filter(i => /aweme-avatar|aweme\\/100x100/i.test(i.src||''));"
-                            " const rows=[...document.querySelectorAll('*')].filter(e=>{"
-                            "   const t=(e.textContent||'');"
-                            "   return e.querySelector&&e.querySelector('img')&&t.length>1&&t.length<80"
-                            "     && e.getBoundingClientRect().width>150; });"
-                            " return {url:location.href.slice(0,60), imgs:imgs.length,"
-                            "   avatars:imgs.slice(0,3).map(i=>(i.src||'').slice(0,50))}; }")
-                        fr_report.append(info)
-                        if info.get("imgs", 0) > 0 and "douyin" in (info.get("url") or ""):
-                            if target_fr is None or info["imgs"] > 0:
-                                target_fr = fr
-                    except Exception as fe:
-                        fr_report.append({"err": repr(fe)[:60]})
-                print(f"[dm-frames] count={len(frames)} report={fr_report}")
-
-                before_keys = {k: len(v) for k, v in dm_msg_bodies.items()}
-                clicked = "no-frame"
-                for fr in ([target_fr] if target_fr else frames):
-                    if fr is None:
-                        continue
-                    try:
-                        clicked = await fr.evaluate(
-                            "() => { const im=[...document.querySelectorAll('img')].find(i =>"
-                            "  /aweme-avatar|aweme\\/100x100/i.test(i.src||''));"
-                            " if(!im) return 'no-avatar'; let r=im;"
-                            " for(let d=0;d<6&&r;d++,r=r.parentElement){"
-                            "   const rc=r.getBoundingClientRect();"
-                            "   if(rc.width>150 && rc.height>=40 && rc.height<=120) break; }"
-                            " (r||im).click();"
-                            " return 'clicked:'+((r||im).className||'').toString().slice(0,30); }")
-                        if clicked.startswith("clicked"):
-                            break
-                    except Exception:
-                        continue
-                print(f"[dm-open] click first conv -> {clicked!r}")
-                await page.wait_for_timeout(3000)
-                after = {k: len(v) for k, v in dm_msg_bodies.items()}
-                changed = {k: after[k] for k in after if after[k] != before_keys.get(k, 0)}
-                print(f"[dm-open] msg endpoints after click: {after} changed={changed}")
-                import base64 as _b64
-                for k, v in dm_msg_bodies.items():
-                    if k != "get_message_by_init" and len(v) > 40:
-                        print(f"[dm-open-body] {k} len={len(v)} "
-                              f"b64:{_b64.b64encode(v[:700]).decode()}")
-            except Exception as e:
-                print(f"[dm-open] probe failed: {e!r}")
 
         final_url = page.url
     except Exception as e:
@@ -1193,95 +1171,39 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
     return list(collected.values()), ("" if collected else error)
 
 
-async def fetch_dm_messages_headed(mgr: BrowserManager, identity, platform: str,
-                                   max_convs: int = 3) -> Tuple[list, str]:
-    """有头浏览器抓每个会话的历史消息(无头面板不渲染,历史接口触发不了)。
-    第一版=标定:开面板→逐个点会话→拦触发的 /v1/message/* protobuf,打印接口+字节。
-    看清历史接口结构后再扩成"解析+全量落库"。返回抓到的 (endpoint,bytes) 列表。"""
+async def fetch_dm_history(mgr: BrowserManager, identity, platform: str,
+                           conv_id: str, conv_short_id: str, conv_type: int = 1,
+                           cursor: int = 0, count: int = 50,
+                           debug: bool = False) -> Tuple[dict, str]:
+    """无头抓单个会话的历史消息:imapi/v1/message/get_by_conversation(cmd 301)。
+    该接口纯 cookie 鉴权、无 a_bogus/签名,用账号常驻 context 的 request 直接 POST。
+    返回 (parse_messages 结果, error)。debug=True 时额外打印原始响应 b64(标定用)。"""
     import base64 as _b64
+    from .douyin_im_pb import build_history_request, parse_messages, GET_BY_CONV_URL
     if platform != "douyin":
-        return [], "仅抖音已支持"
-    hist_bodies: Dict[str, bytes] = {}   # path -> 最大 body
-    seq_log: list = []                   # 每次点击后新增的接口
-    im_hit = [False]
-
-    ctx = await mgr.open_headed(identity)   # 关无头、开有头(同 profile 不能并存)
-    page = await ctx.new_page()
-
-    async def on_resp(resp):
-        u = resp.url
-        if "douyin.com" not in u:
-            return
-        low = u.split("?")[0].lower()
-        if "/v1/message/" in low or "/v1/stranger/" in low:
-            if any(s in low for s in ("/v1/message/", "/v1/stranger/")):
-                im_hit[0] = True
-            try:
-                b = await resp.body()
-            except Exception:
-                b = b""
-            key = low.rsplit("/", 1)[-1]
-            if len(b) > len(hist_bodies.get(key, b"")):
-                hist_bodies[key] = b
-
-    ws_frames_h: list = []
-    def _on_ws(ws):
-        if "frontier-im" not in ws.url:
-            return
-        ws.on("framereceived", lambda p: ws_frames_h.append(("recv", len(p) if p else 0))
-              if len(ws_frames_h) < 40 else None)
-    page.on("websocket", _on_ws)
-
-    page.on("response", on_resp)
-    error = ""
+        return {}, "仅抖音已支持"
+    if not conv_id or not conv_short_id:
+        return {}, "缺 conv_id / conv_short_id"
     try:
-        await page.goto("https://www.douyin.com/follow",
-                        wait_until="domcontentloaded", timeout=30000)
-        if "passport" in page.url or "/login" in page.url:
-            return [], "logged_out:登录态失效,请重新登录"
-        # 真实坐标点「消息」导航(js click 只触发网络、不视觉打开面板)。取最外层那个候选。
-        msgbox = await page.evaluate(
-            """() => { const hits=[...document.querySelectorAll('div,span,a,button,li')]
-                 .filter(e => (e.textContent||'').trim()==='消息');
-               if(!hits.length) return null; let best=null, area=1e9;
-               for(const e of hits){ const rc=e.getBoundingClientRect();
-                 if(rc.width>0&&rc.height>0 && rc.width*rc.height<area){best=e;area=rc.width*rc.height;} }
-               if(!best) return null; const rc=best.getBoundingClientRect();
-               return {x:rc.x+rc.width/2, y:rc.y+rc.height/2}; }""")
-        if msgbox:
-            await page.mouse.move(msgbox["x"], msgbox["y"])
-            await page.wait_for_timeout(250)
-            await page.mouse.click(msgbox["x"], msgbox["y"])
-            print(f"[dm-hist] real-click 消息 @({int(msgbox['x'])},{int(msgbox['y'])})")
-        await page.wait_for_timeout(4000)
-        print(f"[dm-hist] url={page.url} im_hit={im_hit[0]} ws_frames={len(ws_frames_h)}")
-        # dump 左列文本:判定消息面板到底开没开(会话行=昵称/预览 vs 视频流=视频标题)
-        leftcol = await page.evaluate(
-            """() => { const out=[], seen=new Set();
-               const els=[...document.querySelectorAll('div,span,p')].filter(e=>{
-                 const rc=e.getBoundingClientRect(); const t=(e.textContent||'').trim();
-                 return rc.left<480 && rc.top>110 && rc.width>60 && t.length>=2 && t.length<=40
-                   && e.children.length<=3; });
-               for(const e of els){ const t=(e.textContent||'').trim();
-                 if(seen.has(t)) continue; seen.add(t); out.push(t.slice(0,30));
-                 if(out.length>=24) break; } return out; }""")
-        print(f"[dm-hist] left-col text({len(leftcol)}): {leftcol}")
-        clicked = 0
-        # 打印各私信接口字节(离线解结构)
-        for k, v in hist_bodies.items():
-            print(f"[dm-hist-body] {k} len={len(v)} "
-                  f"b64:{_b64.b64encode(v[:800]).decode()}")
-        print(f"[dm-hist] done im_hit={im_hit[0]} ws_frames={len(ws_frames_h)} "
-              f"endpoints={list(hist_bodies)}")
+        ctx = await mgr.context_for(identity)      # 常驻无头 context(带 cookie)
+        req = build_history_request(conv_id, int(conv_type or 1),
+                                    int(conv_short_id), int(cursor or 0), count)
+        resp = await ctx.request.post(
+            GET_BY_CONV_URL, data=req,
+            headers={"content-type": "application/x-protobuf",
+                     "referer": "https://www.douyin.com/"})
+        body = await resp.body()
+        parsed = parse_messages(body)
+        if debug:
+            print(f"[dm-hist] conv={conv_id} status={resp.status} "
+                  f"resp_len={len(body)} msgs={len(parsed.get('messages', []))} "
+                  f"next_cursor={parsed.get('next_cursor')}")
+            print(f"[dm-hist-raw] b64:{_b64.b64encode(body[:1200]).decode()}")
+        if resp.status != 200:
+            return parsed, f"imapi 返回 {resp.status}"
+        return parsed, ""
     except Exception as e:
-        error = f"有头抓消息失败: {e!r}"
-        print(f"[dm-hist] ERROR {error}")
-    finally:
-        try:
-            await ctx.close()
-        except Exception:
-            pass
-    return [(k, len(v)) for k, v in hist_bodies.items()], error
+        return {}, f"抓历史失败: {e!r}"
 
 
 # ═══════════ 写操作(无公开接口:登录态浏览器 UI 自动化) ═══════════
@@ -1364,6 +1286,43 @@ _DM_ENTRY_URL = {
     "xhs": "https://www.xiaohongshu.com/user/profile/{uid}",
     "kuaishou": "https://www.kuaishou.com/profile/{uid}",
 }
+
+
+_SEND_URL = "https://imapi.douyin.com/v1/message/send"
+
+
+async def send_dm_api(mgr: BrowserManager, identity, conv_id: str,
+                      conv_short_id: str, ticket: str, text: str,
+                      conv_type: int = 1) -> Tuple[bool, str]:
+    """抖音无头发私信:imapi/v1/message/send(cmd 100),cookie POST(先按零签名试,
+    与读/ mark_read 一致)。需已有会话的 conv_id + short_id + ticket(同步会话列表时已存库)。"""
+    import time
+    import uuid as _uuid
+    from .douyin_im_pb import build_send_request, parse_send_response
+    text = (text or "").strip()
+    if not text:
+        return False, "空内容"
+    if not (conv_id and conv_short_id and ticket):
+        return False, "缺 conv_id/short_id/ticket(先同步会话列表)"
+    try:
+        ctx = await mgr.context_for(identity)
+        cmid = str(_uuid.uuid4())
+        stime = int(time.time() * 1000)
+        req = build_send_request(conv_id, int(conv_type or 1), int(conv_short_id),
+                                 ticket, text, cmid, stime)
+        resp = await ctx.request.post(
+            _SEND_URL, data=req,
+            headers={"content-type": "application/x-protobuf",
+                     "referer": "https://www.douyin.com/"})
+        body = await resp.body()
+        r = parse_send_response(body)
+        print(f"[dm-send] conv={conv_id} status={resp.status} "
+              f"ok={r['ok']} msg={r['msg']!r} code={r['error_code']} resp_len={len(body)}")
+        if resp.status == 200 and r["ok"]:
+            return True, ""
+        return False, f"发送被拒 status={resp.status} msg={r['msg']} code={r['error_code']}"
+    except Exception as e:
+        return False, f"发送失败: {e!r}"
 
 
 async def send_dm(mgr: BrowserManager, identity, platform: str, target_uid: str = "",

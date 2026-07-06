@@ -13,6 +13,7 @@ class DouyinAccount(SQLModel, table=True):
     platform: str = Field(default="douyin", index=True)  # douyin | xhs
     nickname: str = ""
     sec_uid: str = ""              # 抖音 sec_uid / 小红书 user_id
+    uid: str = ""                  # 抖音数字 uid(= IM device_id,用于 frontier-im WS 接收)
     douyin_id: str = ""            # 抖音号 / 小红书号(red_id)
     avatar: str = ""              # 头像
     follower_count: int = 0

@@ -12,8 +12,8 @@ from .xhs_fetcher import (fetch_xhs_notes, fetch_xhs_search, fetch_xhs_note_deta
 from .ks_fetcher import (fetch_ks_videos, fetch_ks_comments, fetch_ks_self_profile,
                          post_ks_comment)
 from .account_hub import (fetch_account_works, fetch_follows,
-                          fetch_dm_conversations, fetch_dm_messages_headed,
-                          do_follow, send_dm)
+                          fetch_dm_conversations, fetch_dm_history,
+                          do_follow, send_dm, send_dm_api)
 
 __all__ = ["BrowserManager", "cookie_string_to_state",
            "Identity", "generate_identity_fields", "seed_from_id", "fingerprint_script",
@@ -26,5 +26,5 @@ __all__ = ["BrowserManager", "cookie_string_to_state",
            "fetch_xhs_comments", "fetch_xhs_self_profile", "fetch_creator_published",
            "fetch_ks_videos", "fetch_ks_comments", "fetch_ks_self_profile",
            "post_ks_comment", "fetch_account_works", "fetch_follows",
-           "fetch_dm_conversations", "fetch_dm_messages_headed",
-           "do_follow", "send_dm"]
+           "fetch_dm_conversations", "fetch_dm_history",
+           "do_follow", "send_dm", "send_dm_api"]

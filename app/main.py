@@ -12,7 +12,7 @@ from datetime import datetime
 import uuid as _uuid
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import select
@@ -23,7 +23,7 @@ from .browser import (BrowserManager, cookie_string_to_state,
                       interactive_ks_login, interactive_ks_creator_login,
                       fetch_self_profile, fetch_xhs_self_profile, fetch_ks_self_profile,
                       fetch_account_works, fetch_follows, fetch_dm_conversations,
-                      fetch_dm_messages_headed)
+                      fetch_dm_history)
 from .platforms.douyin import parse_self_user
 from .config import load_config
 from .db import get_session, init_db
@@ -53,6 +53,7 @@ import json
 cfg = load_config()
 browser: BrowserManager | None = None
 engine: MonitorEngine | None = None
+im_receiver = None      # ImReceiverManager(私信实时接收)
 login_tasks: Dict[str, dict] = {}
 # 用户手动打开的账号浏览器窗口(account_id -> BrowserContext),留引用防 GC、便于复用/清理
 open_browsers: Dict[int, Any] = {}
@@ -60,7 +61,7 @@ open_browsers: Dict[int, Any] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global browser, engine
+    global browser, engine, im_receiver
     init_db(cfg.db_path)
     # config.yaml 里配的 proxies 导入数据库代理池(之后统一在页面管理)
     try:
@@ -81,7 +82,11 @@ async def lifespan(app: FastAPI):
     await browser.start()
     engine = MonitorEngine(cfg, browser)
     engine.start()
+    from .engine.im_receiver import ImReceiverManager
+    im_receiver = ImReceiverManager(browser)
     yield
+    if im_receiver:
+        await im_receiver.stop_all()
     if engine:
         await engine.stop()
     if browser:
@@ -767,13 +772,68 @@ async def sync_dm(account_id: int):
                     msg_type="text", text=c["last_text"],
                     create_time=c.get("last_time") or 0))
                 msgs += 1
+        # 顺带存账号自身 uid(= IM device_id,实时接收 WS 要用);从任一会话的 self_uid 取
+        self_uid = ""
+        for c in convs:
+            try:
+                self_uid = (json.loads(c.get("raw_json") or "{}")).get("self_uid", "")
+            except Exception:
+                self_uid = ""
+            if self_uid:
+                break
+        if self_uid:
+            acc2 = s.get(DouyinAccount, account_id)
+            if acc2 and acc2.uid != self_uid:
+                acc2.uid = self_uid
+                s.add(acc2)
         s.commit()
     return {"ok": True, "fetched": len(convs), "added": len(convs), "messages": msgs}
 
 
-@app.post("/api/accounts/{account_id}/dm/sync-messages")
-async def sync_dm_messages(account_id: int, max_convs: int = 3):
-    """有头浏览器抓会话历史消息(标定阶段:打印历史接口+字节到控制台)。"""
+@app.get("/api/dm/stream")
+async def dm_stream(account_id: int):
+    """私信实时事件流(SSE)。前端打开 DM 面板时订阅;订阅即为该账号拉起 frontier-im
+    WS 长连接,新消息实时推来(也已入库)。最后一个订阅断开时自动停连。"""
+    if im_receiver is None:
+        raise HTTPException(503, "实时接收未就绪")
+    q = await im_receiver.subscribe(account_id)
+
+    async def gen():
+        try:
+            yield "retry: 3000\nevent: ready\ndata: {}\n\n"
+            while True:
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=25)
+                    yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"     # 心跳,防代理断流
+        except asyncio.CancelledError:
+            pass
+        finally:
+            im_receiver.unsubscribe(account_id, q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/accounts/{account_id}/dm/conversations/{conv_id:path}/mark-read")
+async def mark_dm_read(account_id: int, conv_id: str):
+    """标记会话已读:清本地未读计数(红点)。"""
+    with get_session() as s:
+        conv = s.exec(select(DmConversation).where(
+            DmConversation.account_id == account_id,
+            DmConversation.conv_id == conv_id)).first()
+        if conv and conv.unread_count:
+            conv.unread_count = 0
+            s.add(conv); s.commit()
+    return {"ok": True}
+
+
+@app.post("/api/accounts/{account_id}/dm/conversations/{conv_id:path}/fetch-history")
+async def fetch_dm_conversation_history(account_id: int, conv_id: str,
+                                        cursor: int = 0, debug: bool = False):
+    """无头抓单个会话历史消息(imapi get_by_conversation,纯 cookie),落库 DmMessage。"""
     if browser is None:
         raise HTTPException(503, "浏览器未就绪")
     with get_session() as s:
@@ -782,13 +842,50 @@ async def sync_dm_messages(account_id: int, max_convs: int = 3):
             raise HTTPException(404, "账号不存在")
         platform = acc.platform
         identity = browser.identity_for(acc)
-    caps, err = await fetch_dm_messages_headed(browser, identity, platform,
-                                               max_convs=max_convs)
-    if err and err.startswith("logged_out"):
-        raise HTTPException(400, "登录态已失效,请点「重新登录」")
+        conv = s.exec(select(DmConversation).where(
+            DmConversation.account_id == account_id,
+            DmConversation.conv_id == conv_id)).first()
+        if not conv:
+            raise HTTPException(404, "会话不存在(先同步会话列表)")
+        short_id, self_uid = conv.conv_short_id, ""
+        try:
+            self_uid = (json.loads(conv.raw_json or "{}")).get("self_uid", "")
+        except Exception:
+            pass
+    if not short_id:
+        raise HTTPException(400, "该会话缺 conversation_short_id,请重新同步会话列表")
+    parsed, err = await fetch_dm_history(browser, identity, platform, conv_id,
+                                         short_id, conv_type=1, cursor=cursor,
+                                         debug=debug)
     if err:
         raise HTTPException(400, err)
-    return {"ok": True, "endpoints": caps}
+    msgs = parsed.get("messages", [])
+    added = 0
+    with get_session() as s:
+        # 按会话快照重写:拉到消息就清掉该会话旧消息(含 last:<conv> 占位、旧错时间戳),
+        # 再插本次窗口。get_by_conversation 每次返回最近一窗,快照式最简单且能纠正旧数据。
+        if msgs:
+            for old in s.exec(select(DmMessage).where(
+                    DmMessage.account_id == account_id,
+                    DmMessage.conv_id == conv_id)).all():
+                s.delete(old)
+        seen = set()
+        for m in msgs:
+            mid = m.get("server_msg_id") or ""
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            direction = ("out" if self_uid and m.get("sender_uid") == self_uid
+                         else "in")
+            s.add(DmMessage(
+                platform=platform, account_id=account_id, conv_id=conv_id,
+                msg_id=mid, direction=direction,
+                msg_type=("text" if m.get("text") else str(m.get("msg_type") or "")),
+                text=m.get("text") or "", create_time=int(m.get("create_time") or 0)))
+            added += 1
+        s.commit()
+    return {"ok": True, "fetched": len(msgs), "added": added,
+            "next_cursor": parsed.get("next_cursor"), "has_more": parsed.get("has_more")}
 
 
 # ─────────── 本账号管理:计数汇总(账号管理面板徽章,纯查库不触发抓取)───────────
