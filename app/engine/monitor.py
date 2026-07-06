@@ -21,7 +21,7 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_xhs_comments, fetch_xhs_self_profile,
                        post_comment_browser,
                        fetch_ks_videos, fetch_ks_comments, fetch_ks_self_profile,
-                       post_ks_comment, do_follow, send_dm)
+                       post_ks_comment, do_follow, send_dm, send_dm_api)
 from . import compose
 from ..config import Config
 from ..db import get_session
@@ -40,7 +40,7 @@ from ..platforms.kuaishou import (parse_ks_feed, parse_ks_comment,
 from ..models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                       CommentWatch, DouyinAccount, MonitorTarget,
                       NotificationChannel, PublishTask, AccountActionTask,
-                      FollowEdge)
+                      FollowEdge, DmConversation)
 from ..notifier import notify_all
 from ..settings import get_setting
 from .downloader import Downloader
@@ -1529,6 +1529,14 @@ class MonitorEngine:
             action = t.action
             target_uid, target_sec_uid, content = t.target_uid, t.target_sec_uid, t.content
             platform = t.platform
+            # 抖音发私信优先走无头 API(imapi/send):取会话的 short_id+ticket
+            dm_conv_id, dm_short_id, dm_ticket = t.conv_id, "", ""
+            if action == "send_dm" and platform == "douyin" and t.conv_id:
+                _conv = s.exec(select(DmConversation).where(
+                    DmConversation.account_id == t.account_id,
+                    DmConversation.conv_id == t.conv_id)).first()
+                if _conv:
+                    dm_short_id, dm_ticket = _conv.conv_short_id, _conv.ticket
             # commit 会 expire 本 session 内的实例,先把所需原语取出来再 commit
             identity = self.browser.identity_for(acc)
             t.status = "doing"; t.method = "browser"; t.error = ""
@@ -1542,8 +1550,16 @@ class MonitorEngine:
                 ok, err = await do_follow(self.browser, identity, platform,
                                           target_uid, target_sec_uid, unfollow=True)
             elif action == "send_dm":
-                ok, err = await send_dm(self.browser, identity, platform,
-                                        target_uid, target_sec_uid, content)
+                # 抖音:有会话信息就走无头 API 发送;失败或缺信息再回退 UI 自动化
+                if platform == "douyin" and dm_conv_id and dm_short_id and dm_ticket:
+                    ok, err = await send_dm_api(self.browser, identity, dm_conv_id,
+                                                dm_short_id, dm_ticket, content)
+                    if not ok:
+                        ok, err = await send_dm(self.browser, identity, platform,
+                                                target_uid, target_sec_uid, content)
+                else:
+                    ok, err = await send_dm(self.browser, identity, platform,
+                                            target_uid, target_sec_uid, content)
             else:
                 ok, err = False, f"未知动作 {action}"
         except Exception as e:

@@ -466,6 +466,7 @@ function switchTab(name) {
   });
   try { localStorage.setItem("dym-tab", name); } catch (e) {}
   if (name === "hub") { refreshHubSummary(); refreshHubPanel(); }
+  else stopDmStream();   // 离开本账号管理即断开私信实时流
 }
 
 // ─── 扫码登录(真实浏览器窗口) ───
@@ -720,7 +721,7 @@ let DM_CONV = null;     // 当前打开的会话 id
 let DM_CONVS = [];      // 会话缓存(供发送时取 peer 信息)
 function hubAccKey() { return "dym-hubacc:" + PLATFORM; }
 function loadHubAcc() { try { HUB_ACC = localStorage.getItem(hubAccKey()) || ""; } catch (e) { HUB_ACC = ""; } }
-function setHubAcc(id) { HUB_ACC = String(id || ""); try { localStorage.setItem(hubAccKey(), HUB_ACC); } catch (e) {} }
+function setHubAcc(id) { HUB_ACC = String(id || ""); try { localStorage.setItem(hubAccKey(), HUB_ACC); } catch (e) {} if (HUB_TAB === "dm") startDmStream(); }
 
 // 用该账号登录态弹出真实浏览器窗口,留给用户手动操作(收发私信 / 维护 / F12 抓接口)
 async function openAccountBrowser(id) {
@@ -773,6 +774,7 @@ function switchHubTab(name) {
   try { localStorage.setItem("dym-hubtab", name); } catch (e) {}
   document.querySelectorAll("[data-hubpanel]").forEach(p => { p.style.display = p.dataset.hubpanel === name ? "" : "none"; });
   document.querySelectorAll("[data-hubtab]").forEach(t => t.classList.toggle("active", t.dataset.hubtab === name));
+  if (name === "dm") startDmStream(); else stopDmStream();
   refreshHubPanel();
 }
 // 计数徽章:纯查库汇总,进面板/换账号/切平台即刷新,不用点进子页才有数
@@ -789,7 +791,7 @@ function refreshHubPanel() {
   if (HUB_TAB === "myworks") refreshMyWorks();
   else if (HUB_TAB === "following") refreshFollows("following");
   else if (HUB_TAB === "fans") refreshFollows("fan");
-  else if (HUB_TAB === "dm") refreshDmConvs();
+  else if (HUB_TAB === "dm") { refreshDmConvs(); startDmStream(); }
 }
 function hubGridEmpty(text, sub = "") {
   return `<div class="empty" style="width:100%;column-span:all;break-inside:avoid"><div class="empty-ic">${ic("i-inbox")}</div>` +
@@ -954,6 +956,28 @@ async function actFollow(action, edgeId) {
 }
 
 // ── 私信 ──
+// ─── 私信实时接收(SSE):进 DM 面板订阅,新消息即时刷新;离开断开 ───
+let DM_SSE = null, DM_SSE_ACC = "";
+function startDmStream() {
+  // 幂等:同账号已连就不重连(避免每次面板刷新/收到消息都断开重来)
+  if (DM_SSE && DM_SSE_ACC === HUB_ACC && DM_SSE.readyState !== 2) return;
+  stopDmStream();
+  if (!HUB_ACC || PLATFORM !== "douyin") return;
+  DM_SSE_ACC = HUB_ACC;
+  try {
+    DM_SSE = new EventSource(`/api/dm/stream?account_id=${HUB_ACC}`);
+    DM_SSE.onmessage = (e) => {
+      let evt; try { evt = JSON.parse(e.data); } catch (_) { return; }
+      if (!evt || !evt.conv_id) return;
+      // 当前打开的会话:实时刷新线程 + 标记已读(不让红点冒出来);否则只刷列表(会有红点)
+      if (evt.conv_id === DM_CONV) { refreshDmMessages(); markDmRead(evt.conv_id); }
+      else refreshDmConvs();
+    };
+    DM_SSE.onerror = () => { /* EventSource 自带重连 */ };
+  } catch (_) {}
+}
+function stopDmStream() { if (DM_SSE) { try { DM_SSE.close(); } catch (_) {} DM_SSE = null; DM_SSE_ACC = ""; } }
+
 async function refreshDmConvs() {
   const box = $("dm-convs"); if (!box) return;
   if (!HUB_ACC) { box.innerHTML = `<div class="empty" style="padding:24px"><div class="empty-t">请先选择账号</div></div>`; return; }
@@ -985,7 +1009,21 @@ async function syncDm() {
 async function openDmConv(convId) {
   DM_CONV = convId;
   document.querySelectorAll("#dm-convs .dm-conv").forEach(e => e.classList.toggle("active", e.dataset.conv === convId));
+  const thread = $("dm-thread");
+  if (thread) thread.innerHTML = `<div class="empty"><div class="empty-t">加载聊天记录…</div></div>`;
+  // 抖音:点开会话时无头拉历史(imapi get_by_conversation),落库后再渲染
+  if (PLATFORM === "douyin") {
+    try { await api(`/api/accounts/${HUB_ACC}/dm/conversations/${convId}/fetch-history`, { method: "POST" }); }
+    catch (e) { /* 拉取失败也照常显示库里已有的(最后一条) */ }
+  }
+  markDmRead(convId);
   await refreshDmMessages();
+}
+// 标记已读:清红点,刷新左侧列表
+function markDmRead(convId) {
+  if (!HUB_ACC || !convId) return;
+  api(`/api/accounts/${HUB_ACC}/dm/conversations/${convId}/mark-read`, { method: "POST" })
+    .then(() => refreshDmConvs()).catch(() => {});
 }
 async function refreshDmMessages() {
   const thread = $("dm-thread"); if (!thread || !HUB_ACC || !DM_CONV) return;
@@ -993,7 +1031,7 @@ async function refreshDmMessages() {
     const msgs = await api(`/api/dm/messages?account_id=${HUB_ACC}&conv_id=${encodeURIComponent(DM_CONV)}`);
     thread.innerHTML = msgs.length
       ? msgs.map(m => `<div class="dm-bubble ${m.direction === "out" ? "out" : "in"}">${esc(m.text)}<span class="t">${fmtTime(m.create_time)}</span></div>`).join("")
-      : `<div class="empty"><div class="empty-t">暂无消息记录</div><div class="empty-sub">先点上方「同步」拉最后一条消息;完整聊天记录需「打开浏览器收发」进入该会话</div></div>`;
+      : `<div class="empty"><div class="empty-t">暂无消息记录</div><div class="empty-sub">该会话没有可拉取的历史(或对方为系统号)</div></div>`;
     thread.scrollTop = thread.scrollHeight;
   } catch (e) { thread.innerHTML = `<div class="empty"><div class="empty-t">加载失败:${esc(e.message)}</div></div>`; }
 }
@@ -1010,6 +1048,9 @@ async function sendDm() {
         body: JSON.stringify({ account_id: +HUB_ACC, action: "send_dm", target_uid: c.peer_uid || "", target_sec_uid: c.peer_sec_uid || "", target_nick: c.peer_nickname || "", conv_id: DM_CONV, content: text, run_now: true })
       });
       inp.value = ""; toast("已发送", "ok");
+      // 发完重拉历史,展示刚发出的消息(imapi 有短暂延迟,稍等再拉)
+      await new Promise(r => setTimeout(r, 700));
+      await openDmConv(DM_CONV);
     } catch (e) { toast("发送失败:" + e.message, "err"); }
   });
 }
