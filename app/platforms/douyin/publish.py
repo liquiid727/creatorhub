@@ -39,9 +39,26 @@ _PUBLISH_BTN = ['button:has-text("发布")', 'button:has-text("发布作品")',
 
 _DEBUG_DIR = Path("./data/debug")
 
+# 发布成功信号(文案任一命中即算成功)
+_SUCCESS_KW = ("发布成功", "作品发布成功", "投稿成功", "发布完成", "已发布", "审核中")
+# 抖音风控人工验证(短信验证码 / 扫码 / 滑块):需用户在弹出窗口里手动完成,不能自动化
+_VERIFY_KW = ("接收短信验证码", "短信验证码", "为确保是本人操作", "输入验证码",
+              "安全验证", "完成验证", "拖动滑块", "使用原设备扫码", "身份验证")
+
 
 def _log(msg: str) -> None:
     print(f"[dy-publish] {msg}", flush=True)
+
+
+async def _visible_any(page, keywords) -> str:
+    """返回第一个当前可见的关键词文案(无则空串);用于快速轮询,不阻塞等待。"""
+    for kw in keywords:
+        try:
+            if await page.get_by_text(kw, exact=False).first.is_visible():
+                return kw
+        except Exception:
+            continue
+    return ""
 
 
 async def _dump(page, tag: str) -> str:
@@ -208,23 +225,34 @@ async def publish_douyin(mgr: BrowserManager, identity: Identity,
                 await _dump(page, "clickfail")
                 return False, "", "发布按钮点击失败(可能被弹层遮挡/需补封面)。已存诊断截图。"
 
-        # 成功判定:跳内容管理页,或出现成功/审核中文案
+        # 成功判定 + 风控验证等待:抖音点发布后常弹「短信验证码/扫码」要本人操作,
+        # 这时必须把弹出的窗口留给用户手动完成,故轮询等待、给足时间(默认最多 5 分钟)。
         ok = False
-        try:
-            await page.wait_for_url("**/content/manage**", timeout=25000)
-            ok = True
-        except Exception:
-            for kw in ("发布成功", "作品发布成功", "投稿成功", "已发布", "审核中", "发布完成"):
-                try:
-                    await page.get_by_text(kw, exact=False).first.wait_for(timeout=4000)
-                    ok = True
-                    _log(f"命中成功文案「{kw}」")
-                    break
-                except Exception:
-                    continue
+        deadline = max(int(timeout_seconds), 300)   # 秒;留足人工验证时间
+        waited, verify_notified = 0, False
+        while waited < deadline:
+            if "/content/manage" in page.url:
+                ok = True
+                break
+            hit = await _visible_any(page, _SUCCESS_KW)
+            if hit:
+                ok = True
+                _log(f"命中成功文案「{hit}」")
+                break
+            vkw = await _visible_any(page, _VERIFY_KW)
+            if vkw and not verify_notified:
+                verify_notified = True
+                await _dump(page, "verify")
+                _log(f"⚠️ 抖音要求人工验证「{vkw}」—— 请在弹出的浏览器窗口里完成"
+                     f"(输入短信验证码 / 扫码 / 滑块),完成后本流程会自动继续,最多等 {deadline}s")
+            await page.wait_for_timeout(2000)
+            waited += 2
         result_url = page.url if ok else ""
         if ok:
             _log(f"发布成功 url={result_url}")
+        elif verify_notified:
+            error = ("发布被抖音风控拦下,需人工验证(短信验证码/扫码),但在等待时间内未完成。"
+                     "请在弹窗里完成验证后重试;若窗口已关,重新点「立即发布」再操作。")
         else:
             png = await _dump(page, "unconfirmed")
             error = ("已点发布但未在页面确认到成功信号。请到抖音创作平台「作品管理」看是否已在列表"
