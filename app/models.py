@@ -146,6 +146,8 @@ class PublishTask(SQLModel, table=True):
     desc: str = ""                                     # 正文
     topics: str = ""                                   # 话题,逗号分隔(不带 #)
     media_json: str = ""                               # 本地文件路径列表(JSON)
+    visibility: str = "public"                         # 抖音:public 公开 | friends 好友可见 | private 仅自己可见
+    allow_save: bool = True                            # 抖音:是否允许他人保存(下载)
     scheduled_at: Optional[datetime] = None            # 定时发布时间(空=尽快发)
     status: str = "pending"        # pending | publishing | done | failed | canceled
     result_url: str = ""           # 发布成功后的笔记链接(能取到则填)

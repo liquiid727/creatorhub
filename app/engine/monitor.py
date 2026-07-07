@@ -1039,6 +1039,7 @@ class MonitorEngine:
                     state = acc.creator_storage_state or acc.storage_state or ""
                     identity = self.browser.identity_for(acc)
             media_type, title, desc, topics = t.media_type, t.title, t.desc, t.topics
+            visibility, allow_save = t.visibility, t.allow_save
             platform = t.platform
             files = _loads_list(t.media_json)
             t.status = "publishing"; t.error = ""
@@ -1065,7 +1066,8 @@ class MonitorEngine:
             try:
                 ok, url, err = await publish_douyin(self.browser, identity, state,
                                                     media_type, title, desc, files,
-                                                    topics=topics, headed=True)
+                                                    topics=topics, visibility=visibility,
+                                                    allow_save=allow_save, headed=True)
             except Exception as e:
                 ok, url, err = False, "", f"发布异常: {e!r}"
             return await self._finish_publish(task_id, ok, url, err, platform="douyin")

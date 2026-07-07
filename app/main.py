@@ -2098,6 +2098,8 @@ class PublishIn(BaseModel):
     desc: str = ""
     topics: str = ""
     media_paths: list[str] = []
+    visibility: str = "public"            # 抖音:public | friends | private
+    allow_save: bool = True               # 抖音:是否允许他人保存
     scheduled_at: str | None = None       # ISO 时间(本地),空=尽快发
 
 
@@ -2106,6 +2108,7 @@ def _publish_dict(t: PublishTask) -> dict:
         "id": t.id, "platform": t.platform, "account_id": t.account_id,
         "media_type": t.media_type, "title": t.title, "desc": t.desc,
         "topics": t.topics, "status": t.status, "result_url": t.result_url,
+        "visibility": t.visibility, "allow_save": t.allow_save,
         "error": t.error, "media_count": len(json.loads(t.media_json or "[]")),
         "source_platform": t.source_platform, "source_content_id": t.source_content_id,
         "scheduled_at": t.scheduled_at.isoformat() if t.scheduled_at else None,
@@ -2150,9 +2153,11 @@ async def add_publish(body: PublishIn):
                 raise HTTPException(400, f"该{pname}账号不可发布:请先在账号页完成「创作者登录」")
         elif not (acc.creator_storage_state or has_creator_cookies(acc.storage_state)):
             raise HTTPException(400, "该账号不可发布:请对该号完成「小红书扫码登录」或「创作者登录」")
+        vis = body.visibility if body.visibility in ("public", "friends", "private") else "public"
         t = PublishTask(
             platform=acc.platform, account_id=body.account_id, media_type=body.media_type,
             title=body.title.strip()[:20], desc=body.desc, topics=body.topics,
+            visibility=vis, allow_save=bool(body.allow_save),
             media_json=json.dumps(paths), scheduled_at=_parse_when(body.scheduled_at),
         )
         s.add(t); s.commit(); s.refresh(t)

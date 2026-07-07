@@ -955,6 +955,21 @@
           <input id="pub-topics" placeholder="话题(逗号分隔,不用带 #),如:露营,户外">
           <input type="datetime-local" id="pub-when" aria-label="定时发布(留空=尽快发)" style="flex:0 0 220px">
         </div>
+        <div class="row dy-only" id="pub-dy-opts" style="justify-content:flex-start;gap:18px;align-items:center">
+          <label class="field" style="flex:0 0 auto;margin:0;display:flex;align-items:center;gap:6px">谁可以看
+            <select id="pub-visibility" aria-label="谁可以看">
+              <option value="public">公开</option>
+              <option value="friends">好友可见</option>
+              <option value="private">仅自己可见</option>
+            </select>
+          </label>
+          <label class="field" style="flex:0 0 auto;margin:0;display:flex;align-items:center;gap:6px">保存权限
+            <select id="pub-allowsave" aria-label="保存权限">
+              <option value="1">允许他人保存</option>
+              <option value="0">不允许</option>
+            </select>
+          </label>
+        </div>
         <div class="row" style="justify-content:flex-start">
           <button onclick="addPublish()" style="flex:0 0 auto"><svg><use href="#i-send"/></svg>加入发布队列</button>
           <span class="mut" id="pub-msg" style="flex:1"></span>

@@ -145,13 +145,35 @@ async def _primary_publish_button(page):
     return cand
 
 
+async def _choose_radio(page, label: str) -> bool:
+    """点一个单选项(按可见文本精确匹配)。用于「谁可以看 / 保存权限」等发布设置。"""
+    try:
+        await page.get_by_text(label, exact=True).first.click(timeout=2500)
+        _log(f"已选发布设置「{label}」")
+        return True
+    except Exception:
+        _log(f"未点中发布设置「{label}」(可能默认已选或改版)")
+        return False
+
+
+async def _apply_publish_settings(page, visibility: str, allow_save: bool) -> None:
+    """设置「谁可以看」「保存权限」。公开 / 允许为抖音默认值,非默认才点,减少误点。"""
+    vis_label = {"friends": "好友可见", "private": "仅自己可见"}.get(visibility, "")
+    if vis_label:                       # public=默认,不动
+        await _choose_radio(page, vis_label)
+    if not allow_save:                  # 允许=默认,只在「不允许」时点
+        await _choose_radio(page, "不允许")
+
+
 async def publish_douyin(mgr: BrowserManager, identity: Identity,
                          storage_state_json: str, media_type: str, title: str,
                          desc: str, media_paths: List[str], topics: str = "",
+                         visibility: str = "public", allow_save: bool = True,
                          headed: bool = True, timeout_seconds: int = 180
                          ) -> Tuple[bool, str, str]:
     """发布一条抖音作品。返回 (ok, result_url, error)。
-    storage_state_json 仅用于校验(实际登录态在该账号持久 profile 里)。"""
+    storage_state_json 仅用于校验(实际登录态在该账号持久 profile 里)。
+    visibility: public 公开 | friends 好友可见 | private 仅自己可见;allow_save: 是否允许他人保存。"""
     files = [str(Path(p)) for p in media_paths if p and Path(p).exists()]
     if not files:
         return False, "", "没有可用的本地媒体文件(路径不存在)"
@@ -196,7 +218,11 @@ async def publish_douyin(mgr: BrowserManager, identity: Identity,
         if body:
             if not await _fill_first(page, _DESC_SEL, body):
                 _log("警告:未能填入简介(选择器可能改版)")
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(800)
+
+        # 发布设置:谁可以看 / 保存权限(公开、允许为默认,仅非默认才点)
+        await _apply_publish_settings(page, visibility, allow_save)
+        await page.wait_for_timeout(600)
 
         # 轮询等「发布」按钮可用(视频未处理完时按钮 disabled),最多 ~90s
         btn = None
