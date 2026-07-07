@@ -145,15 +145,58 @@ async def _primary_publish_button(page):
     return cand
 
 
-async def _choose_radio(page, label: str) -> bool:
-    """点一个单选项(按可见文本精确匹配)。用于「谁可以看 / 保存权限」等发布设置。"""
+async def _dump_radios(page) -> None:
+    """把页面上疑似单选项/可点标签的真实文案打出来,便于按实际文案校准。"""
     try:
-        await page.get_by_text(label, exact=True).first.click(timeout=2500)
-        _log(f"已选发布设置「{label}」")
-        return True
+        texts = await page.eval_on_selector_all(
+            'label, [role="radio"], .semi-radio, .semi-radio-addon, [class*="radio"]',
+            "els => els.map(e => (e.innerText||'').trim()).filter(t => t && t.length <= 12)")
+        seen, out = set(), []
+        for t in texts:
+            if t not in seen:
+                seen.add(t); out.append(t)
+        _log(f"页面可选项文案候选: {out[:40]}")
+    except Exception as e:
+        _log(f"枚举单选项失败: {e!r}")
+
+
+async def _choose_radio(page, label: str) -> bool:
+    """点一个单选项。抖音用 Semi Design 单选(文本外套 label/icon),
+    单纯 get_by_text 常点不中,故多策略:role → 精确文本 → label 祖先 → 强制点。"""
+    # 1) 无障碍 role=radio(Semi 会给 radio 组件挂 role)
+    try:
+        loc = page.get_by_role("radio", name=label, exact=True)
+        if await loc.count():
+            await loc.first.scroll_into_view_if_needed(timeout=2000)
+            await loc.first.click(timeout=2500)
+            _log(f"已选发布设置「{label}」(role)")
+            return True
     except Exception:
-        _log(f"未点中发布设置「{label}」(可能默认已选或改版)")
-        return False
+        pass
+    # 2) 精确文本节点 → 点它,以及点它最近的可点祖先(label / .semi-radio)
+    try:
+        node = page.get_by_text(label, exact=True).first
+        if await node.count():
+            await node.scroll_into_view_if_needed(timeout=2000)
+            for target in (node,
+                           node.locator('xpath=ancestor-or-self::label[1]'),
+                           node.locator('xpath=ancestor-or-self::*[contains(@class,"radio")][1]')):
+                try:
+                    if await target.count():
+                        await target.first.click(timeout=2000)
+                        _log(f"已选发布设置「{label}」(text/ancestor)")
+                        return True
+                except Exception:
+                    continue
+            # 3) 强制点(绕过遮挡判定)
+            await node.click(timeout=2000, force=True)
+            _log(f"已选发布设置「{label}」(force)")
+            return True
+    except Exception:
+        pass
+    _log(f"⚠️ 未点中发布设置「{label}」—— 下面打印页面实际可选项供校准:")
+    await _dump_radios(page)
+    return False
 
 
 async def _apply_publish_settings(page, visibility: str, allow_save: bool) -> None:
