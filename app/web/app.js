@@ -2066,16 +2066,41 @@ function rpDrawThumbs() {
   if (!RP_MEDIA.length) { box.style.display = "none"; box.innerHTML = ""; return; }
   const n = RP_MEDIA.length;
   box.innerHTML = RP_MEDIA.map((m, pos) => `
-    <div class="rp-th">
-      <img src="${esc(m.url)}" referrerpolicy="no-referrer" alt="" title="点击看大图" onclick="openPreview(${REPOST_ID})">
+    <div class="rp-th" draggable="true" data-pos="${pos}"
+         ondragstart="rpDragStart(${pos},event)" ondragover="rpDragOver(${pos},event)"
+         ondragleave="rpDragLeave(event)" ondrop="rpDrop(${pos},event)" ondragend="rpDragEnd()">
+      <img src="${esc(m.url)}" referrerpolicy="no-referrer" draggable="false" alt="" title="点击看大图" onclick="openPreview(${REPOST_ID})">
       <span class="rp-th-badge${pos === 0 ? " cover" : ""}">${pos === 0 ? "封面" : pos + 1}</span>
       <button type="button" class="rp-th-x" title="移除这张" onclick="rpImgRemove(${pos})">✕</button>
       <div class="rp-th-mv">
         <button type="button" onclick="rpImgMove(${pos},-1)" ${pos === 0 ? "disabled" : ""} title="前移(移到最前=封面)">‹</button>
         <button type="button" onclick="rpImgMove(${pos},1)" ${pos === n - 1 ? "disabled" : ""} title="后移">›</button>
       </div>
-    </div>`).join("") + `<span class="rp-th-more">共 ${n} 张 · 首图为封面</span>`;
+    </div>`).join("") + `<span class="rp-th-more">共 ${n} 张 · 拖拽排序 · 首图为封面</span>`;
   box.style.display = "flex";
+}
+let RP_DRAG = -1;
+function rpDragStart(pos, ev) {
+  RP_DRAG = pos;
+  try { ev.dataTransfer.effectAllowed = "move"; ev.dataTransfer.setData("text/plain", String(pos)); } catch (e) {}
+}
+function rpDragOver(pos, ev) {
+  ev.preventDefault();
+  try { ev.dataTransfer.dropEffect = "move"; } catch (e) {}
+  if (RP_DRAG !== -1 && pos !== RP_DRAG && ev.currentTarget) ev.currentTarget.classList.add("dragover");
+}
+function rpDragLeave(ev) { if (ev.currentTarget) ev.currentTarget.classList.remove("dragover"); }
+function rpDrop(pos, ev) {
+  ev.preventDefault();
+  const from = RP_DRAG; RP_DRAG = -1;
+  if (from < 0 || from >= RP_MEDIA.length || from === pos) { rpDrawThumbs(); return; }
+  const [item] = RP_MEDIA.splice(from, 1);
+  RP_MEDIA.splice(pos, 0, item);   // 拖到目标位置(其余顺延)
+  rpDrawThumbs();
+}
+function rpDragEnd() {
+  RP_DRAG = -1;
+  document.querySelectorAll("#rp-thumbs .rp-th.dragover").forEach(e => e.classList.remove("dragover"));
 }
 function rpImgRemove(pos) {
   if (RP_MEDIA.length <= 1) { toast("至少保留一张图片", "err"); return; }
