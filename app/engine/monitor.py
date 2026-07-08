@@ -964,16 +964,26 @@ class MonitorEngine:
         folder = p if p.is_dir() else p.parent
         if not folder.exists():
             return []
-        files = sorted(str(f) for f in folder.glob(f"{rec.aweme_id}_*")
-                       if f.is_file() and not f.name.endswith(".part"))
-        return files
+        # 文件名形如 {aweme_id}_{title}_{index}.{ext};按末尾数字序号排(而非字典序,
+        # 否则 10 张以上会 _10 排到 _2 前面 —— 图集顺序错乱、封面选错)。
+        def _idx_key(f: Path):
+            tail = f.stem.rsplit("_", 1)[-1]
+            return (0, int(tail)) if tail.isdigit() else (1, f.name)
+        cands = [f for f in folder.glob(f"{rec.aweme_id}_*")
+                 if f.is_file() and not f.name.endswith(".part")]
+        return [str(f) for f in sorted(cands, key=_idx_key)]
 
-    def create_relay_publish(self, content_id: int, xhs_account_id: int,
+    def create_relay_publish(self, content_id: int, account_id: int,
+                             target_platform: str = "xhs",
                              title: Optional[str] = None, desc: Optional[str] = None,
-                             topics: Optional[str] = None) -> Optional[int]:
-        """从一条已下载的抖音作品创建一个发往小红书的发布任务。返回任务 id。
+                             topics: Optional[str] = None,
+                             visibility: str = "public", allow_save: bool = True,
+                             media_order: Optional[list] = None
+                             ) -> Optional[int]:
+        """从一条已下载的作品创建一个发往目标平台(小红书 / 抖音)的发布任务。返回任务 id。
 
         只接收作品 id,内部自开会话取记录,避免跨会话传入已绑定的 ORM 对象。
+        target_platform:发布目标平台(xhs 默认;douyin 为小红书→抖音的反向转发)。
         title/desc/topics 为 None 时沿用作品原始内容;传了则用编辑后的值(发布前可改)。
         """
         with get_session() as s:
@@ -983,13 +993,22 @@ class MonitorEngine:
             files = self._content_files(rec)
             if not files:
                 return None
-            t_title = (title if title is not None else (rec.desc or ""))[:20]
+            # 转发前若在弹窗里剔除/调序了图片,media_order 是保留下来的原始序号(按新顺序)。
+            # 按它过滤+重排本地文件(首个=封面);越界序号忽略,全无效则回退全部原序。
+            if media_order:
+                picked = [files[i] for i in media_order
+                          if isinstance(i, int) and 0 <= i < len(files)]
+                if picked:
+                    files = picked
+            title_cap = 30 if target_platform == "douyin" else 20   # 抖音标题上限更宽
+            t_title = (title if title is not None else (rec.desc or ""))[:title_cap]
             t_desc = desc if desc is not None else (rec.desc or "")
             t_topics = topics if topics is not None else ""
             task = PublishTask(
-                platform="xhs", account_id=xhs_account_id,
+                platform=target_platform, account_id=account_id,
                 media_type="video" if rec.media_type == "video" else "images",
                 title=t_title, desc=t_desc, topics=t_topics,
+                visibility=visibility, allow_save=allow_save,
                 media_json=json.dumps(files),
                 source_platform=rec.platform, source_content_id=rec.id,
             )

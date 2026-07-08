@@ -244,6 +244,8 @@
     background:rgba(6,7,10,.82); backdrop-filter:blur(6px); padding:24px;
     animation:slideIn .18s var(--ease);
   }
+  /* 预览层要能盖在转发弹窗(#repost 同为 pv-overlay)之上,否则点缩略图看不到大图 */
+  #preview { z-index:110; }
   .pv-box {
     position:relative; background:var(--surface); border:1px solid var(--line);
     border-radius:var(--r-lg); box-shadow:var(--sh);
@@ -268,6 +270,20 @@
   .rp-box h2 { margin:0 0 16px; font-size:17px; }
   .rp-box .field { display:block; margin:0 0 5px; }
   .rp-src { color:var(--mut); font-size:12px; margin:-6px 0 2px; }
+  .rp-thumbs { display:flex; gap:8px; align-items:center; overflow-x:auto; padding:2px 0 6px; }
+  .rp-th { position:relative; flex:0 0 auto; width:72px; cursor:grab; }
+  .rp-th:active { cursor:grabbing; }
+  .rp-th.dragover { outline:2px dashed var(--brand, #ff2e51); outline-offset:2px; border-radius:10px; }
+  .rp-th img, .rp-thumbs .rp-th-ph { width:72px; height:72px; border-radius:10px; object-fit:cover; cursor:zoom-in; border:1px solid var(--line, #e5e5e5); background:var(--card, #f4f4f4); display:block; }
+  .rp-thumbs .rp-th-ph { flex:0 0 auto; display:flex; align-items:center; justify-content:center; }
+  .rp-th-badge { position:absolute; top:3px; left:3px; font-size:10px; line-height:1; padding:2px 5px; border-radius:6px; background:rgba(0,0,0,.55); color:#fff; pointer-events:none; }
+  .rp-th-badge.cover { background:var(--brand, #ff2e51); }
+  .rp-th-x { position:absolute; top:2px; right:2px; width:18px; height:18px; border:none; border-radius:50%; background:rgba(0,0,0,.6); color:#fff; font-size:11px; line-height:1; cursor:pointer; padding:0; display:flex; align-items:center; justify-content:center; }
+  .rp-th-x:hover { background:#e0245e; }
+  .rp-th-mv { position:absolute; bottom:2px; left:2px; right:2px; display:flex; justify-content:space-between; }
+  .rp-th-mv button { width:22px; height:18px; border:none; border-radius:5px; background:rgba(0,0,0,.55); color:#fff; cursor:pointer; font-size:13px; line-height:1; padding:0; }
+  .rp-th-mv button:disabled { opacity:.3; cursor:default; }
+  .rp-th-more { flex:0 0 auto; align-self:center; color:var(--mut); font-size:12px; white-space:nowrap; padding:0 4px; }
 
   /* carousel */
   .pv-carousel { position:relative; width:100%; overflow:hidden; }
@@ -1285,14 +1301,32 @@
 <div id="repost" class="pv-overlay" style="display:none" onclick="if(event.target.id==='repost')hideRepost()" role="dialog" aria-modal="true">
   <div class="rp-box">
     <button class="pv-close" onclick="hideRepost()" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
-    <h2>发小红书 · 编辑后推送</h2>
+    <h2 id="rp-head">发小红书 · 编辑后推送</h2>
     <div class="stack">
+      <div id="rp-thumbs" class="rp-thumbs" style="display:none"></div>
       <div>
         <label class="field" for="rp-acc">发布账号</label>
         <select id="rp-acc" aria-label="发布账号"></select>
       </div>
+      <div class="row dy-repost-only" id="rp-dy-opts" style="display:none;gap:14px;flex-wrap:wrap">
+        <div style="flex:1 1 190px;min-width:150px">
+          <label class="field" for="rp-visibility" style="white-space:nowrap">谁可以看</label>
+          <select id="rp-visibility" aria-label="谁可以看" style="width:100%">
+            <option value="public">公开</option>
+            <option value="friends">好友可见</option>
+            <option value="private">仅自己可见</option>
+          </select>
+        </div>
+        <div style="flex:1 1 190px;min-width:150px">
+          <label class="field" for="rp-allowsave" style="white-space:nowrap">保存权限</label>
+          <select id="rp-allowsave" aria-label="保存权限" style="width:100%">
+            <option value="1">允许他人保存</option>
+            <option value="0">不允许</option>
+          </select>
+        </div>
+      </div>
       <div>
-        <label class="field" for="rp-title">标题(≤20 字)</label>
+        <label class="field" for="rp-title" id="rp-title-label">标题(≤20 字)</label>
         <input id="rp-title" maxlength="20" placeholder="给笔记起个标题">
       </div>
       <div>

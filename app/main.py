@@ -2349,11 +2349,13 @@ class RepostIn(BaseModel):
     title: str | None = None
     desc: str | None = None
     topics: str | None = None
+    visibility: str = "public"           # 抖音:public | friends | private
+    allow_save: bool = True              # 抖音:是否允许他人保存
+    media_order: list[int] | None = None  # 剔除/调序后保留的图片原始序号(按新顺序);None=全部原序
 
 
-@app.post("/api/contents/{cid}/repost-xhs")
-async def repost_to_xhs(cid: int, body: RepostIn):
-    """把一条已下载的抖音作品转成小红书发布任务。"""
+async def _repost_content(cid: int, body: RepostIn, target_platform: str):
+    """把一条已下载的作品转成目标平台(xhs / douyin)的发布任务。跨平台转发共用。"""
     if not engine:
         raise HTTPException(503, "引擎未就绪")
     # 1) 只在会话内做校验,取出需要的值后退出会话,不把 ORM 对象带出去
@@ -2364,15 +2366,23 @@ async def repost_to_xhs(cid: int, body: RepostIn):
         if rec.download_status != "done":
             raise HTTPException(400, "该作品尚未下载完成,无法转发")
         acc = s.get(DouyinAccount, body.account_id)
-        if not acc or acc.platform != "xhs":
-            raise HTTPException(400, "请选择一个已登录的小红书账号")
-        if not (acc.creator_storage_state or has_creator_cookies(acc.storage_state)):
+        if not acc or acc.platform != target_platform:
+            pname = "抖音" if target_platform == "douyin" else "小红书"
+            raise HTTPException(400, f"请选择一个已登录的{pname}账号")
+        if target_platform == "douyin":
+            # 抖音发布走浏览器自动化,有任一登录态即可(需创作者/登录态)
+            if not (acc.creator_storage_state or acc.storage_state):
+                raise HTTPException(400, "该抖音账号不可发布:请先在账号页完成「创作者登录」")
+        elif not (acc.creator_storage_state or has_creator_cookies(acc.storage_state)):
             raise HTTPException(400, "该账号不可发布:请对该号完成「小红书扫码登录」或「创作者登录」")
     # 2) 退出会话后再创建发布任务(create_relay_publish 内部自开会话)
     #    若前端传了编辑后的标题/正文/话题,则用编辑值覆盖作品原始内容
+    vis = body.visibility if body.visibility in ("public", "friends", "private") else "public"
     tid = engine.create_relay_publish(
-        cid, body.account_id,
-        title=body.title, desc=body.desc, topics=body.topics)
+        cid, body.account_id, target_platform=target_platform,
+        title=body.title, desc=body.desc, topics=body.topics,
+        visibility=vis, allow_save=bool(body.allow_save),
+        media_order=body.media_order)
     if not tid:
         raise HTTPException(400, "未找到该作品的本地文件,无法转发")
     # 3) 定时时间另开一个会话更新
@@ -2383,6 +2393,18 @@ async def repost_to_xhs(cid: int, body: RepostIn):
                 t.scheduled_at = _parse_when(body.scheduled_at)
                 s.add(t); s.commit()
     return {"ok": True, "task_id": tid}
+
+
+@app.post("/api/contents/{cid}/repost-xhs")
+async def repost_to_xhs(cid: int, body: RepostIn):
+    """把一条已下载的抖音作品转成小红书发布任务。"""
+    return await _repost_content(cid, body, "xhs")
+
+
+@app.post("/api/contents/{cid}/repost-douyin")
+async def repost_to_douyin(cid: int, body: RepostIn):
+    """把一条已下载的小红书作品转成抖音发布任务(反向转发)。"""
+    return await _repost_content(cid, body, "douyin")
 
 
 # ─────────── 自动评论(规则 + 任务)───────────

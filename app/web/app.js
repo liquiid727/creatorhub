@@ -1605,6 +1605,7 @@ function noteCard(r) {
       <div class="ncard-actions">
         <span class="pill ${r.download_status}" style="flex:1;justify-content:center" title="${esc(r.error || "")}">${r.download_status}${r.error ? " ⓘ" : ""}</span>
         ${r.download_status === "failed" ? `<button class="ghost sm" onclick="retryDl(${r.id})">重试</button>` : ""}
+        ${(PLATFORM === "xhs" && r.download_status === "done") ? `<button class="ghost sm" onclick="repostDouyin(${r.id})">发抖音</button>` : ""}
         <button class="ghost sm" onclick="delContent(${r.id})">删除</button>
       </div>
     </div>
@@ -1636,6 +1637,7 @@ async function refreshContents() {
       <span class="pill ${r.download_status}">${r.download_status}</span>${r.error ? ` <span class="warn-ic" title="${esc(r.error)}">${ic("i-info")}</span>` : ""}
       ${r.download_status === "failed" ? ` <button class="ghost sm" onclick="retryDl(${r.id})">重试</button>` : ""}
       ${(PLATFORM === "douyin" && r.download_status === "done") ? ` <button class="ghost sm" onclick="repostXhs(${r.id})">发小红书</button>` : ""}
+      ${(PLATFORM === "xhs" && r.download_status === "done") ? ` <button class="ghost sm" onclick="repostDouyin(${r.id})">发抖音</button>` : ""}
       <button class="ghost sm" onclick="delContent(${r.id})">删除</button>
     </td>
     <td class="mut num" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.local_path || "")}">${esc(r.local_path || "")}</td>
@@ -1760,16 +1762,19 @@ function _pvRender(d) {
   }
   cap.textContent = d.desc || "";
 }
-async function _pvOpen(fetcher) {
+async function _pvOpen(fetcher, startIdx) {
   const ov = $("preview"), box = $("pv-media");
   PV_N = 0; PV_I = 0;
   box.innerHTML = `<div class="pv-loading">加载中…</div>`; $("pv-cap").textContent = "";
   ov.style.display = "flex";
-  try { _pvRender(await fetcher()); }
+  try {
+    _pvRender(await fetcher());
+    if (startIdx && PV_N > 1) { PV_I = Math.max(0, Math.min(startIdx, PV_N - 1)); pvUpdate(); }
+  }
   catch (e) { box.innerHTML = `<div class="pv-loading">预览失败:${esc(e.message)}</div>`; }
 }
-function openPreview(id) {
-  return _pvOpen(() => api("/api/contents/" + id + "/media"));
+function openPreview(id, startIdx) {
+  return _pvOpen(() => api("/api/contents/" + id + "/media"), startIdx || 0);
 }
 function openPubPreview(accId, noteId, tok, src) {
   return _pvOpen(() => api(`/api/publish/note-media?account_id=${accId}&note_id=${encodeURIComponent(noteId)}&xsec_token=${encodeURIComponent(tok || "")}&xsec_source=${encodeURIComponent(src || "")}`));
@@ -1998,24 +2003,124 @@ async function _pickXhsAccount(withOff) {
   return +v;
 }
 let REPOST_ID = null;
-async function repostXhs(id) {
+let REPOST_TARGET = "xhs";           // 转发目标平台:xhs(抖音→小红书) | douyin(小红书→抖音)
+const repostXhs = (id) => openRepost(id, "xhs");
+const repostDouyin = (id) => openRepost(id, "douyin");
+async function openRepost(id, target) {
   const rec = CONTENTS.find(r => r.id === id);
-  // 拉取可发布的小红书创作号填充下拉
-  const all = await api("/api/accounts?platform=xhs");
-  const accs = all.filter(a => a.has_creator);
-  if (!accs.length) { toast("请先在小红书账号页完成「创作者登录」(发布用)", "err"); return; }
-  REPOST_ID = id;
+  // 拉取目标平台可发布账号:小红书需创作号;抖音需任一登录态(走浏览器自动化)
+  const all = await api("/api/accounts?platform=" + target);
+  const accs = target === "xhs"
+    ? all.filter(a => a.has_creator)
+    : all.filter(a => a.has_storage || a.has_creator);
+  if (!accs.length) {
+    toast(target === "xhs" ? "请先在小红书账号页完成「创作者登录」(发布用)"
+      : "请先在抖音账号页完成登录(扫码/创作者/Cookie)", "err");
+    return;
+  }
+  REPOST_ID = id; REPOST_TARGET = target;
+  const isDy = target === "douyin", cap = isDy ? 30 : 20;
+  $("rp-head").textContent = (isDy ? "发抖音" : "发小红书") + " · 编辑后推送";
+  $("rp-title-label").textContent = `标题(≤${cap} 字)`;
+  $("rp-title").maxLength = cap;
+  $("rp-title").placeholder = isDy ? "给作品起个标题" : "给笔记起个标题";
   $("rp-acc").innerHTML = accs.map(a => `<option value="${a.id}">${esc(a.nickname)}</option>`).join("");
   const desc = (rec && rec.desc) || "";
-  $("rp-title").value = desc.slice(0, 20);   // 默认用作品描述前 20 字当标题
+  $("rp-title").value = desc.slice(0, cap);   // 默认用作品描述前若干字当标题
   $("rp-desc").value = desc;
   $("rp-topics").value = "";
   $("rp-when").value = ""; dtSyncAll();
   $("rp-msg").textContent = "";
   $("rp-src").textContent = rec ? `来源:${rec.media_type === "images" ? "图集" : "视频"} · ${esc((rec.desc || "(无描述)").slice(0, 30))}` : "";
+  // 抖音发布设置(可见性 / 保存权限)仅目标为抖音时显示
+  if ($("rp-dy-opts")) $("rp-dy-opts").style.display = isDy ? "flex" : "none";
+  if (isDy) { if ($("rp-visibility")) $("rp-visibility").value = "public"; if ($("rp-allowsave")) $("rp-allowsave").value = "1"; }
+  renderRepostThumbs(id);   // 异步拉媒体缩略图,不阻塞弹窗
   $("rp-submit").disabled = false;
   $("repost").style.display = "flex";
   $("rp-title").focus();
+}
+let RP_MEDIA = [];         // 可编辑图集:[{url, idx}](idx=原始序号,提交时回传)
+let RP_MEDIA_LEN = 0;      // 原始图片总数(判断是否被编辑过)
+let RP_IS_VIDEO = false;
+async function renderRepostThumbs(id) {
+  const box = $("rp-thumbs"); if (!box) return;
+  RP_MEDIA = []; RP_MEDIA_LEN = 0; RP_IS_VIDEO = false;
+  box.style.display = "none"; box.innerHTML = "";
+  try {
+    const d = await api("/api/contents/" + id + "/media");
+    if (REPOST_ID !== id) return;   // 弹窗已切换/关闭
+    const vid = (d.medias || []).find(m => m.kind === "video");
+    if (d.media_type === "video" && vid) {
+      RP_IS_VIDEO = true;
+      box.innerHTML = `<div class="rp-th-ph" onclick="openPreview(${id})" title="点击预览视频">${ic("i-play")}</div>`;
+      box.style.display = "flex";
+      return;
+    }
+    const imgs = (d.medias || []).filter(m => m.kind === "image").map(m => m.url);
+    const all = imgs.length ? imgs : (d.cover_url ? [d.cover_url] : []);
+    RP_MEDIA = all.map((u, i) => ({ url: u, idx: i }));
+    RP_MEDIA_LEN = RP_MEDIA.length;
+    rpDrawThumbs();
+  } catch (e) { /* 预览失败不影响转发 */ }
+}
+function rpDrawThumbs() {
+  const box = $("rp-thumbs"); if (!box) return;
+  if (!RP_MEDIA.length) { box.style.display = "none"; box.innerHTML = ""; return; }
+  const n = RP_MEDIA.length;
+  box.innerHTML = RP_MEDIA.map((m, pos) => `
+    <div class="rp-th" draggable="true" data-pos="${pos}"
+         ondragstart="rpDragStart(${pos},event)" ondragover="rpDragOver(${pos},event)"
+         ondragleave="rpDragLeave(event)" ondrop="rpDrop(${pos},event)" ondragend="rpDragEnd()">
+      <img src="${esc(m.url)}" referrerpolicy="no-referrer" draggable="false" alt="" title="点击看大图" onclick="openPreview(${REPOST_ID},${m.idx})">
+      <span class="rp-th-badge${pos === 0 ? " cover" : ""}">${pos === 0 ? "封面" : pos + 1}</span>
+      <button type="button" class="rp-th-x" title="移除这张" onclick="rpImgRemove(${pos})">✕</button>
+      <div class="rp-th-mv">
+        <button type="button" onclick="rpImgMove(${pos},-1)" ${pos === 0 ? "disabled" : ""} title="前移(移到最前=封面)">‹</button>
+        <button type="button" onclick="rpImgMove(${pos},1)" ${pos === n - 1 ? "disabled" : ""} title="后移">›</button>
+      </div>
+    </div>`).join("") + `<span class="rp-th-more">共 ${n} 张 · 拖拽排序 · 首图为封面</span>`;
+  box.style.display = "flex";
+}
+let RP_DRAG = -1;
+function rpDragStart(pos, ev) {
+  RP_DRAG = pos;
+  try { ev.dataTransfer.effectAllowed = "move"; ev.dataTransfer.setData("text/plain", String(pos)); } catch (e) {}
+}
+function rpDragOver(pos, ev) {
+  ev.preventDefault();
+  try { ev.dataTransfer.dropEffect = "move"; } catch (e) {}
+  if (RP_DRAG !== -1 && pos !== RP_DRAG && ev.currentTarget) ev.currentTarget.classList.add("dragover");
+}
+function rpDragLeave(ev) { if (ev.currentTarget) ev.currentTarget.classList.remove("dragover"); }
+function rpDrop(pos, ev) {
+  ev.preventDefault();
+  const from = RP_DRAG; RP_DRAG = -1;
+  if (from < 0 || from >= RP_MEDIA.length || from === pos) { rpDrawThumbs(); return; }
+  const [item] = RP_MEDIA.splice(from, 1);
+  RP_MEDIA.splice(pos, 0, item);   // 拖到目标位置(其余顺延)
+  rpDrawThumbs();
+}
+function rpDragEnd() {
+  RP_DRAG = -1;
+  document.querySelectorAll("#rp-thumbs .rp-th.dragover").forEach(e => e.classList.remove("dragover"));
+}
+function rpImgRemove(pos) {
+  if (RP_MEDIA.length <= 1) { toast("至少保留一张图片", "err"); return; }
+  RP_MEDIA.splice(pos, 1); rpDrawThumbs();
+}
+function rpImgMove(pos, dir) {
+  const j = pos + dir;
+  if (j < 0 || j >= RP_MEDIA.length) return;
+  [RP_MEDIA[pos], RP_MEDIA[j]] = [RP_MEDIA[j], RP_MEDIA[pos]];
+  rpDrawThumbs();
+}
+// 图片被编辑过(删了 / 调了序)才回传 media_order;未动则 null 用全部原序
+function rpMediaOrder() {
+  if (RP_IS_VIDEO || !RP_MEDIA.length) return null;
+  const order = RP_MEDIA.map(m => m.idx);
+  const unchanged = order.length === RP_MEDIA_LEN && order.every((v, i) => v === i);
+  return unchanged ? null : order;
 }
 function hideRepost() { $("repost").style.display = "none"; REPOST_ID = null; }
 async function submitRepost() {
@@ -2030,12 +2135,16 @@ async function submitRepost() {
     desc: $("rp-desc").value,
     topics: $("rp-topics").value.trim(),
     scheduled_at: $("rp-when").value || null,
+    visibility: $("rp-visibility") ? $("rp-visibility").value : "public",
+    allow_save: $("rp-allowsave") ? $("rp-allowsave").value !== "0" : true,
+    media_order: rpMediaOrder(),
   };
+  const pname = REPOST_TARGET === "douyin" ? "抖音" : "小红书";
   try {
-    const r = await api("/api/contents/" + REPOST_ID + "/repost-xhs", {
+    const r = await api("/api/contents/" + REPOST_ID + "/repost-" + REPOST_TARGET, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    toast((body.scheduled_at ? "已加入定时发布队列" : "已加入小红书发布队列") + "(任务 #" + r.task_id + ")", "ok");
+    toast((body.scheduled_at ? "已加入定时发布队列" : `已加入${pname}发布队列`) + "(任务 #" + r.task_id + ")", "ok");
     hideRepost();
     if (typeof refreshPublish === "function") refreshPublish();
   } catch (e) { $("rp-msg").textContent = "失败:" + e.message; toast("转发失败:" + e.message, "err"); btn.disabled = false; }
