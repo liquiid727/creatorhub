@@ -39,9 +39,22 @@ class EngineConfig:
     comment_daily_cap_per_account: int = 30  # 每账号每日自动评论总上限(跨所有规则),0=不限
     comment_min_gap_seconds: int = 60        # 同账号两条评论的全局最小间隔(秒)
     comment_jitter: float = 0.4              # 评论发送时间额外抖动比例(±40%),更像真人
+    comment_hourly_cap_per_account: int = 10  # 每账号每小时自动评论上限(比日上限更贴人类节律),0=不限
     # 抖音发评论用有头浏览器(弹真实窗口):抖音对无头写操作常降级/拦截,有头更稳,
     # 且能让你手动过验证码;量大嫌弹窗可设 false 试无头。
     comment_browser_headed: bool = True
+    # ── 本账号写操作风控闸(取关/回关/私信,与自动评论同级)──
+    #   关注/取关是抖音封号重灾区,默认比评论更保守。
+    action_daily_cap_per_account: int = 20   # 每账号每日写操作总上限(跨所有动作),0=不限
+    action_hourly_cap_per_account: int = 6   # 每账号每小时写操作上限,0=不限
+    action_min_gap_seconds: int = 90         # 同账号两次写操作全局最小间隔(与任务级 min_gap 取大)
+    # ── 活跃时段(夜间静默)──
+    #   仅约束「写操作」(评论/关注/取关/私信)自动排队执行;读取抓取不受影响。
+    #   按东八区(账号时区)小时判定,避免整个账号矩阵在深夜齐发的机器特征。
+    quiet_hours_enabled: bool = True         # 夜间静默总开关
+    active_hours_start: int = 8              # 活跃起点小时(含),0-23
+    active_hours_end: int = 24               # 活跃止点小时(不含);可 >24 表示跨零点(如 25=次日 1 点)
+    verify_proxy_region: bool = True         # 体检时探测代理出口国家,与账号时区不一致则告警
 
 
 @dataclass

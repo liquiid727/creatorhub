@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,11 @@ _STEALTH = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
     "--disable-infobars",
+    # 关键:禁止 WebRTC 走非代理 UDP。否则真实 Chromium 会通过 STUN 直接暴露宿主
+    # 公网/内网 IP,绕过我们在 HTTP 层设的账号代理 —— 所有号在 WebRTC 上露同一真实
+    # 出口 IP,一号一代理的防关联就白做了。这个 flag 让 WebRTC 只认代理路径。
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
 ]
 
 # storage_state 里允许注入的 Cookie 字段(playwright add_cookies 接受的键)
@@ -87,9 +93,54 @@ class BrowserManager:
         self._last_used: Dict[Any, float] = {}
         self._locks: Dict[Any, asyncio.Lock] = {}
         self._cv_lock = asyncio.Lock()                   # 保护 context 字典的创建/驱逐
+        self._chrome_major: Optional[int] = None         # 实际 Chromium 大版本(启动时探测)
 
     async def start(self):
         self._pw = await async_playwright().start()
+        self._chrome_major = await self._detect_chrome_major()
+
+    async def _detect_chrome_major(self) -> Optional[int]:
+        """探测 Playwright 实际内置的 Chromium 大版本。
+        账号 UA 池写死了 Chrome 版本,但真实内核可能是另一版本 —— 二者不一致时,
+        Sec-CH-UA 请求头 / navigator.userAgentData 由真实内核发出,会和 UA 字符串对不上,
+        成为自动化特征。这里读一次真实 UA,后续把账号 UA 的版本号归一到它。"""
+        try:
+            b = await self._pw.chromium.launch(headless=True, args=_STEALTH)
+            try:
+                pg = await b.new_page()
+                ua = await pg.evaluate("navigator.userAgent")
+            finally:
+                await b.close()
+            m = re.search(r"Chrome/(\d+)", ua or "")
+            return int(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    def _normalize_ua(self, ua: str) -> str:
+        """把账号 UA 的 Chrome/Edg 大版本对齐到真实内核版本(未探测到则原样返回)。"""
+        if not self._chrome_major or not ua:
+            return ua
+        v = self._chrome_major
+        ua = re.sub(r"Chrome/\d+", f"Chrome/{v}", ua)
+        ua = re.sub(r"Edg/\d+", f"Edg/{v}", ua)
+        return ua
+
+    def _sec_ch_ua_headers(self, ua: str) -> Optional[Dict[str, str]]:
+        """按归一后的 UA 生成一致的 Client Hints 头,覆盖真实内核默认发出的值。"""
+        v = self._chrome_major
+        if not v:
+            return None
+        if "Edg/" in ua:
+            brands = (f'"Chromium";v="{v}", "Microsoft Edge";v="{v}", '
+                      f'"Not?A_Brand";v="99"')
+        else:
+            brands = (f'"Chromium";v="{v}", "Google Chrome";v="{v}", '
+                      f'"Not?A_Brand";v="99"')
+        platform = ('"macOS"' if "Mac OS" in ua
+                    else '"Linux"' if "Linux" in ua and "Android" not in ua
+                    else '"Windows"')
+        return {"sec-ch-ua": brands, "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": platform}
 
     async def stop(self):
         for ctx in list(self._contexts.values()):
@@ -120,9 +171,10 @@ class BrowserManager:
         pdir = Path(identity.profile_dir)
         pdir.mkdir(parents=True, exist_ok=True)
         was_empty = not any(pdir.iterdir())
+        ua = self._normalize_ua(identity.ua or self.default_ua)
         kwargs: Dict[str, Any] = dict(
             user_data_dir=str(pdir), headless=headless, args=_STEALTH,
-            user_agent=identity.ua or self.default_ua,
+            user_agent=ua,
             viewport={"width": identity.viewport_w, "height": identity.viewport_h},
             locale=identity.locale or "zh-CN",
             timezone_id=identity.timezone_id or "Asia/Shanghai",
@@ -131,9 +183,16 @@ class BrowserManager:
         if proxy:
             kwargs["proxy"] = proxy
         ctx = await self._pw.chromium.launch_persistent_context(**kwargs)
+        # Client Hints 与归一后的 UA 保持一致(否则内核按真实版本发 Sec-CH-UA,和 UA 打架)
+        sec = self._sec_ch_ua_headers(ua)
+        if sec:
+            try:
+                await ctx.set_extra_http_headers(sec)
+            except Exception:
+                pass
         if identity.fp_seed:
             try:
-                await ctx.add_init_script(fingerprint_script(identity.fp_seed))
+                await ctx.add_init_script(fingerprint_script(identity.fp_seed, ua))
             except Exception:
                 pass
         # 迁移桥:全新 profile 首次创建时,把存量登录态 Cookie 注入进去(免重新登录)

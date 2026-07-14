@@ -43,12 +43,19 @@ from ..models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                       NotificationChannel, PublishTask, AccountActionTask,
                       FollowEdge, DmConversation)
 from ..notifier import notify_all
+from ..netfp import probe_ip_region
 from ..settings import get_setting
 from .downloader import Downloader
 
 MAX_AUTO_RETRY = 3
 
 log = logging.getLogger("creatorhub.engine")
+
+# 账号时区 -> 期望出口国家(ISO2)。仅列常见,匹配不到则跳过地区校验。
+_TZ_COUNTRY = {
+    "Asia/Shanghai": "CN", "Asia/Chongqing": "CN", "Asia/Urumqi": "CN",
+    "Asia/Hong_Kong": "HK", "Asia/Macau": "MO", "Asia/Taipei": "TW",
+}
 
 
 def _loads(s: str) -> dict:
@@ -85,6 +92,7 @@ class MonitorEngine:
         self._commenting: set[int] = set()         # 正在执行的评论任务 id
         self._actioning: set[int] = set()           # 正在执行的写操作任务 id
         self._last_acct_check = time.time()   # 上次账号体检时间
+        self._geo_checked: dict = {}          # account_id -> 已校验过地区的代理(避免重复探测)
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -162,6 +170,25 @@ class MonitorEngine:
         factor = 1.0 + random.uniform(-jitter, jitter) if jitter else 1.0
         return (datetime.utcnow() - last_active_at).total_seconds() >= hours * 3600 * factor
 
+    async def _verify_proxy_region(self, account_id, proxy: str, timezone_id: str) -> None:
+        """探测代理出口国家,与账号时区期望不一致时告警(best-effort,只记日志)。
+        同一账号+代理只探测一次(缓存),失败静默 —— IP 在境外却时区东八区是强关联信号。"""
+        if not self.cfg.engine.verify_proxy_region or not proxy:
+            return
+        if self._geo_checked.get(account_id) == proxy:
+            return
+        self._geo_checked[account_id] = proxy
+        expected = _TZ_COUNTRY.get(timezone_id or "")
+        if not expected:
+            return
+        geo = await probe_ip_region(proxy)
+        if not geo or not geo.get("country"):
+            return
+        if geo["country"] != expected:
+            log.warning("账号 %s 代理出口国家 %s 与时区 %s(期望 %s)不一致,IP=%s"
+                        " —— 关联/风控风险,建议换地区一致的长效代理或改账号时区",
+                        account_id, geo["country"], timezone_id, expected, geo.get("ip"))
+
     # ── 账号登录态体检 + 闲置保活 ──
     async def _check_accounts(self):
         interval = self.cfg.engine.account_check_interval_seconds
@@ -182,6 +209,7 @@ class MonitorEngine:
                 accs.append((a.id, a.platform, a.storage_state, a.creator_storage_state,
                              a.proxy or "", self.browser.identity_for(a)))
         for aid, platform, state, creator_state, proxy, identity in accs:
+            await self._verify_proxy_region(aid, proxy, identity.timezone_id)
             try:
                 async with self._account_guard(aid):
                     if platform == "xhs" and creator_state:
@@ -1154,11 +1182,30 @@ class MonitorEngine:
                 pass
         return {"ok": ok, "url": url, "error": err}
 
+    # ── 活跃时段(夜间静默)──
+    def _in_active_window(self) -> bool:
+        """当前是否处于允许写操作的活跃时段(按东八区小时)。夜间静默,降低深夜齐发特征。
+        end<=start 视为配置异常/全天放行;end>24 表示跨零点。"""
+        if not self.cfg.engine.quiet_hours_enabled:
+            return True
+        start = self.cfg.engine.active_hours_start
+        end = self.cfg.engine.active_hours_end
+        if end <= start:
+            return True
+        h = (datetime.utcnow() + timedelta(hours=8)).hour   # 东八区(账号默认时区)
+        if end <= 24:
+            return start <= h < end
+        return h >= start or h < (end - 24)                 # 跨零点
+
     # ── 自动评论:规则生成任务 + 任务执行 ──
     @staticmethod
     def _today_start() -> datetime:
         n = datetime.utcnow()
         return datetime(n.year, n.month, n.day)
+
+    @staticmethod
+    def _hour_ago() -> datetime:
+        return datetime.utcnow() - timedelta(hours=1)
 
     def _acct_today_count(self, s, account_id) -> int:
         """该账号今日已成功发出的评论数(跨所有规则,用于全局每日上限)。"""
@@ -1168,6 +1215,16 @@ class MonitorEngine:
                           .where(CommentTask.account_id == account_id)
                           .where(CommentTask.status == "done")
                           .where(CommentTask.done_at >= self._today_start())).all())
+
+    def _acct_hour_comment_count(self, account_id) -> int:
+        """该账号近一小时已成功发出的评论数(每小时配额,比日上限更贴人类节律)。"""
+        if not account_id:
+            return 0
+        with get_session() as s:
+            return len(s.exec(select(CommentTask.id)
+                              .where(CommentTask.account_id == account_id)
+                              .where(CommentTask.status == "done")
+                              .where(CommentTask.done_at >= self._hour_ago())).all())
 
     def _rule_today_count(self, s, rule_id) -> int:
         return len(s.exec(select(CommentTask.id)
@@ -1287,6 +1344,7 @@ class MonitorEngine:
             gap = max(1, rf["min_gap"], self.cfg.engine.comment_min_gap_seconds)
             jitter = max(0.0, self.cfg.engine.comment_jitter)
             offset = 0.0
+            to_rest = random.randint(3, 6)   # 突发+休息:连发几条后插一段长歇,别匀速排队
             skip = {"dup": 0, "skip_kw": 0, "filter": 0, "empty": 0, "cap": 0}
             for c in cands:
                 if remain <= 0:
@@ -1324,6 +1382,10 @@ class MonitorEngine:
                     skip["empty"] += 1
                     continue
                 step = gap * (1.0 + random.uniform(-jitter, jitter)) if jitter else gap
+                to_rest -= 1
+                if to_rest <= 0:                 # 一簇发完,插一段 3~8 倍 gap 的长歇再继续
+                    step += gap * random.uniform(3, 8)
+                    to_rest = random.randint(3, 6)
                 offset += step
                 sched = base + timedelta(seconds=offset)
                 # 草稿审核:生成 draft,引擎不会自动发,等人工通过
@@ -1514,7 +1576,10 @@ class MonitorEngine:
         return cands, ""
 
     async def _process_comment_tasks(self):
+        if not self._in_active_window():
+            return                                    # 夜间静默:写操作暂停,到点自然继续
         now = datetime.utcnow()
+        hcap = self.cfg.engine.comment_hourly_cap_per_account
         due = []
         with get_session() as s:
             tasks = s.exec(select(CommentTask).where(CommentTask.status == "pending")).all()
@@ -1523,8 +1588,10 @@ class MonitorEngine:
                     due.append((t.id, t.account_id))
         seen_acct = set()
         for tid, aid in due:
-            # 同一轮每账号最多执行一条,且尊重全局最小间隔(其余下轮再发)
+            # 同一轮每账号最多执行一条,且尊重全局最小间隔 + 每小时配额(其余下轮再发)
             if aid in seen_acct or not self._acct_gap_ok(aid):
+                continue
+            if hcap > 0 and self._acct_hour_comment_count(aid) >= hcap:
                 continue
             seen_acct.add(aid)
             try:
@@ -1534,8 +1601,12 @@ class MonitorEngine:
 
     # ── 本账号写操作队列(取关/回关/发私信)──
     def _action_gap_ok(self, account_id, gap: int) -> bool:
-        """距该账号上一次成功写操作是否已超过最小间隔(防同账号连发)。"""
-        if not account_id or gap <= 0:
+        """距该账号上一次成功写操作是否已超过最小间隔(防同账号连发)。
+        实际间隔取「任务级 min_gap」与「全局 action_min_gap_seconds」的较大者。"""
+        if not account_id:
+            return True
+        gap = max(gap, self.cfg.engine.action_min_gap_seconds)
+        if gap <= 0:
             return True
         with get_session() as s:
             rows = s.exec(select(AccountActionTask.done_at)
@@ -1544,7 +1615,29 @@ class MonitorEngine:
         last = max([d for d in rows if d] or [None])
         return last is None or (datetime.utcnow() - last).total_seconds() >= gap
 
+    def _action_count_since(self, account_id, since: datetime) -> int:
+        """该账号自 since 起已成功执行的写操作数(用于每日/每小时上限)。"""
+        if not account_id:
+            return 0
+        with get_session() as s:
+            return len(s.exec(select(AccountActionTask.id)
+                              .where(AccountActionTask.account_id == account_id)
+                              .where(AccountActionTask.status == "done")
+                              .where(AccountActionTask.done_at >= since)).all())
+
+    def _action_cap_ok(self, account_id) -> bool:
+        """写操作是否还在每日 / 每小时配额内(关注取关是封号重灾区,双重限流)。"""
+        dcap = self.cfg.engine.action_daily_cap_per_account
+        hcap = self.cfg.engine.action_hourly_cap_per_account
+        if dcap > 0 and self._action_count_since(account_id, self._today_start()) >= dcap:
+            return False
+        if hcap > 0 and self._action_count_since(account_id, self._hour_ago()) >= hcap:
+            return False
+        return True
+
     async def _process_action_tasks(self):
+        if not self._in_active_window():
+            return                                    # 夜间静默:写操作暂停,到点自然继续
         now = datetime.utcnow()
         due = []
         with get_session() as s:
@@ -1555,8 +1648,10 @@ class MonitorEngine:
                     due.append((t.id, t.account_id, t.min_gap_seconds))
         seen_acct = set()
         for tid, aid, gap in due:
-            # 同账号每轮最多执行一条,且尊重该任务的最小间隔(其余下轮再发)
+            # 同账号每轮最多执行一条,尊重最小间隔 + 每日/每小时配额(其余下轮再发)
             if aid in seen_acct or not self._action_gap_ok(aid, gap):
+                continue
+            if not self._action_cap_ok(aid):
                 continue
             seen_acct.add(aid)
             try:

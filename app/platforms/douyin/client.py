@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi.requests import AsyncSession
 
+import re
+
 from .signing import sign_url, gen_false_ms_token
 from ...netfp import impersonate_for_ua
 
@@ -76,6 +78,13 @@ class DouyinClient:
 
     def _build_url(self, path: str, params: Dict[str, Any]) -> str:
         q = dict(DEFAULT_PARAMS)
+        # 公共参数里的 browser/engine 版本对齐本客户端 UA 的 Chrome 大版本,
+        # 否则 UA 头说一个版本、query 里 browser_version 又是写死的 130,自相矛盾易被风控识别。
+        m = re.search(r"Chrome/(\d+)", self.ua or "")
+        if m:
+            ver = f"{m.group(1)}.0.0.0"
+            q["browser_version"] = ver
+            q["engine_version"] = ver
         q.update({k: v for k, v in params.items() if v is not None})
         q["msToken"] = gen_false_ms_token()
         qs = urllib.parse.urlencode(q)
