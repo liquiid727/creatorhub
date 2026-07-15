@@ -36,13 +36,14 @@ _QUOTED_SECRET_PATTERN = re.compile(
 )
 
 _URL_USERINFO_PATTERN = re.compile(
-    r"(?i)(?:https?:)?//[^/\s:@]+:[^@\s/]+@"
+    r"(?i)(?:[a-z][a-z0-9+.-]*:)?//[^/\s@]+@"
 )
 
 
 def is_sensitive_key(key: Any) -> bool:
     raw = str(key or "").strip()
-    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", raw)
+    normalized = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", raw)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
     normalized = re.sub(r"[-\s]+", "_", normalized).lower()
     return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
 

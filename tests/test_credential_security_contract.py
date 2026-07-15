@@ -69,6 +69,8 @@ def test_text_and_audit_metadata_are_redacted():
     assert redact_text("access_token%253Ddouble-encoded-secret") == "[REDACTED]"
     assert redact_text("http://user:password@proxy.local:8080") == "[REDACTED]"
     assert redact_text("request failed for //user:password@proxy.local") == "[REDACTED]"
+    assert redact_text("http://token@proxy.local") == "[REDACTED]"
+    assert redact_text("http://:password@proxy.local") == "[REDACTED]"
     assert redact_text('{"accessToken":"abc", "apiKey":"def"}') == "[REDACTED]"
     camel_case = redact_mapping({"accessToken": "abc", "apiKey": "def", "safe": "ok"})
     assert camel_case == {
@@ -76,6 +78,13 @@ def test_text_and_audit_metadata_are_redacted():
         "apiKey": "[REDACTED]",
         "safe": "ok",
     }
+    uppercase = redact_mapping({
+        "API_KEY": "abc",
+        "ACCESS_TOKEN": "def",
+        "CLIENT_SECRET": "ghi",
+        "PASSWORD": "jkl",
+    })
+    assert set(uppercase.values()) == {"[REDACTED]"}
     event = AuditEvent(
         event_id="evt-1",
         action="credential.check",
