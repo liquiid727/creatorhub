@@ -85,6 +85,30 @@ BUILTIN_CAPABILITIES: Dict[PlatformId, AdapterCapability] = {
             known_limits=["仅支持创作者助手中的本账号数据", "不支持监控他人作品", "加密 CDN 不承诺下载搬运"],
         ),
     ),
+    PlatformId.WECHAT_MP: AdapterCapability(
+        platform=PlatformId.WECHAT_MP,
+        display_name="微信公众号",
+        capabilities=PlatformCapabilities(
+            public_content_monitor=False,
+            keyword_search=False,
+            own_account_works=False,
+            content_download=False,
+            comment_read=False,
+            comment_write=False,
+            publish=False,
+            follow_graph=False,
+            dm=False,
+            creator_center=True,
+            requires_logged_account_for_read=True,
+            supports_browser_runtime=False,
+            supports_api_runtime=True,
+            known_limits=[
+                "默认 restricted 模式不声明账号数据或发布能力",
+                "认证公众号的官方 API 能力需通过 CredentialRef 启用",
+                "服务端不得托管 C 端普通用户 Cookie",
+            ],
+        ),
+    ),
 }
 
 

@@ -11,11 +11,13 @@ from app.platform_adapter.normalizers import normalize_aweme, normalize_comment
 
 def test_builtin_capability_matrix_is_explicit():
     records = {r.platform.value: r for r in list_capabilities()}
-    assert {"douyin", "xhs", "kuaishou", "shipinhao"}.issubset(records)
+    assert {"douyin", "xhs", "kuaishou", "shipinhao", "wechat_mp"}.issubset(records)
     assert records["xhs"].capabilities.keyword_search is True
     assert records["shipinhao"].capabilities.public_content_monitor is False
     assert records["douyin"].capabilities.publish is True
     assert records["kuaishou"].capabilities.supports_browser_runtime is True
+    assert records["wechat_mp"].capabilities.publish is False
+    assert records["wechat_mp"].capabilities.supports_api_runtime is True
 
 
 def test_registry_rejects_unsupported_capability():

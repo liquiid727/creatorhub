@@ -17,6 +17,7 @@ class PlatformId(str, Enum):
     XHS = "xhs"
     KUAISHOU = "kuaishou"
     SHIPINHAO = "shipinhao"
+    WECHAT_MP = "wechat_mp"
 
 
 @dataclass(frozen=True)
@@ -66,14 +67,21 @@ class AdapterCapability:
     display_name: str
     capabilities: PlatformCapabilities
     adapter_version: str = "0.1.0"
+    capability_modes: Dict[str, PlatformCapabilities] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "platform": self.platform.value,
             "display_name": self.display_name,
             "adapter_version": self.adapter_version,
             "capabilities": self.capabilities.to_dict(),
         }
+        if self.capability_modes:
+            data["capability_modes"] = {
+                mode: capabilities.to_dict()
+                for mode, capabilities in self.capability_modes.items()
+            }
+        return data
 
 
 @dataclass

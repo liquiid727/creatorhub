@@ -15,9 +15,9 @@ from .contracts import AdapterCapability, PlatformCapabilities, PlatformId
 
 def _concrete_adapters() -> list[PlatformAdapter]:
     """Return concrete adapters that are ready behind the contract boundary."""
-    from .adapters import XiaohongshuAdapter
+    from .adapters import WechatMpAdapter, XiaohongshuAdapter
 
-    return [XiaohongshuAdapter()]
+    return [XiaohongshuAdapter(), WechatMpAdapter()]
 
 
 class PlatformAdapter(Protocol):
@@ -60,13 +60,19 @@ class PlatformRegistry:
                 platform=a.platform,
                 display_name=a.display_name,
                 capabilities=a.capabilities,
+                capability_modes=getattr(a, "capability_modes", {}),
             )
             for a in self.all()
         ]
 
-    def require_capability(self, platform: str | PlatformId, capability: str) -> None:
+    def require_capability(
+        self, platform: str | PlatformId, capability: str, mode: str = ""
+    ) -> None:
         adapter = self.get(platform)
-        if not adapter.capabilities.supports(capability):
+        capabilities = adapter.capabilities
+        if mode and hasattr(adapter, "capabilities_for_mode"):
+            capabilities = adapter.capabilities_for_mode(mode)
+        if not capabilities.supports(capability):
             raise UnsupportedPlatformCapability(adapter.platform.value, capability)
 
 
