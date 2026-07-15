@@ -36,7 +36,7 @@ _QUOTED_SECRET_PATTERN = re.compile(
 )
 
 _URL_USERINFO_PATTERN = re.compile(
-    r"(?i)(?:[a-z][a-z0-9+.-]*:)?//[^/\s@]+@"
+    r"(?i)(?:[a-z][a-z0-9+.-]*:)?//[^/\s@?#]+@"
 )
 
 

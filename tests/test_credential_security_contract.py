@@ -71,6 +71,8 @@ def test_text_and_audit_metadata_are_redacted():
     assert redact_text("request failed for //user:password@proxy.local") == "[REDACTED]"
     assert redact_text("http://token@proxy.local") == "[REDACTED]"
     assert redact_text("http://:password@proxy.local") == "[REDACTED]"
+    assert redact_text("https://example.test?email=user@example.org") != "[REDACTED]"
+    assert redact_text("https://example.test#contact=user@example.org") != "[REDACTED]"
     assert redact_text('{"accessToken":"abc", "apiKey":"def"}') == "[REDACTED]"
     camel_case = redact_mapping({"accessToken": "abc", "apiKey": "def", "safe": "ok"})
     assert camel_case == {
