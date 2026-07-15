@@ -26,18 +26,24 @@ _SENSITIVE_KEY_PARTS = (
 
 _TEXT_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*)[^\r\n,;&]+"),
-    re.compile(r"(?i)((?:access_token|refresh_token|api_key|app_secret|client_secret|secret|password|token)\s*[:=]\s*)[^\s,;&]+"),
+    re.compile(r"(?i)((?:access_?token|refresh_?token|api_?key|app_?secret|client_?secret|secret|password|token)\s*[:=]\s*)[^\s,;&]+"),
     re.compile(r"(?i)(cookie\s*=\s*)[^\s,;&]+"),
     re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"),
 )
 
 _QUOTED_SECRET_PATTERN = re.compile(
-    r'''(?i)(["'])(access_token|refresh_token|api_key|app_secret|client_secret|secret|password|token|cookie|authorization)\1\s*:\s*(["'])(.*?)\3'''
+    r'''(?i)(["'])(access_?token|refresh_?token|api_?key|app_?secret|client_?secret|secret|password|token|cookie|authorization)\1\s*:\s*(["'])(.*?)\3'''
+)
+
+_URL_USERINFO_PATTERN = re.compile(
+    r"(?i)(?:https?:)?//[^/\s:@]+:[^@\s/]+@"
 )
 
 
 def is_sensitive_key(key: Any) -> bool:
-    normalized = str(key or "").strip().lower().replace("-", "_")
+    raw = str(key or "").strip()
+    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", raw)
+    normalized = re.sub(r"[-\s]+", "_", normalized).lower()
     return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
 
 
@@ -72,6 +78,8 @@ def _redact_plain_text(value: str) -> str:
 
 def redact_text(value: str) -> str:
     raw = str(value or "")
+    if _URL_USERINFO_PATTERN.search(raw):
+        return REDACTED
     redacted = _redact_plain_text(raw)
     if redacted != raw:
         return REDACTED
@@ -82,5 +90,7 @@ def redact_text(value: str) -> str:
             break
         decoded = next_value
     if decoded != raw and _redact_plain_text(decoded) != decoded:
+        return REDACTED
+    if decoded != raw and _URL_USERINFO_PATTERN.search(decoded):
         return REDACTED
     return raw

@@ -67,6 +67,15 @@ def test_text_and_audit_metadata_are_redacted():
     assert redact_text("access_token%3Dsecret-token") == "[REDACTED]"
     assert redact_text("Authorization%3A%20Bearer%20secret-token") == "[REDACTED]"
     assert redact_text("access_token%253Ddouble-encoded-secret") == "[REDACTED]"
+    assert redact_text("http://user:password@proxy.local:8080") == "[REDACTED]"
+    assert redact_text("request failed for //user:password@proxy.local") == "[REDACTED]"
+    assert redact_text('{"accessToken":"abc", "apiKey":"def"}') == "[REDACTED]"
+    camel_case = redact_mapping({"accessToken": "abc", "apiKey": "def", "safe": "ok"})
+    assert camel_case == {
+        "accessToken": "[REDACTED]",
+        "apiKey": "[REDACTED]",
+        "safe": "ok",
+    }
     event = AuditEvent(
         event_id="evt-1",
         action="credential.check",
