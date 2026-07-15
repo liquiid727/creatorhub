@@ -33,12 +33,6 @@ from ..platforms.douyin import (parse_aweme, parse_comment, parse_creator_commen
                       parse_self_user, DouyinClient, publish_douyin,
                       cookie_from_state as dy_cookie_from_state)
 from ..platforms.douyin.extract import Aweme, MediaItem
-from ..platforms.xhs import (parse_note_brief, parse_note_detail,
-                   parse_comment as parse_xhs_comment,
-                   flatten_comments as flatten_xhs_comments,
-                   parse_self_user as parse_xhs_self_user,
-                   XhsApiClient, XhsApiError, cookie_str_from_state, has_a1,
-                   publish_xhs, creator_check)
 from ..platforms.kuaishou import (parse_ks_feed, parse_ks_comment,
                    flatten_ks_comments, parse_self_user as parse_ks_self_user,
                    publish_kuaishou)
@@ -52,6 +46,7 @@ from ..models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
 from ..notifier import notify_all
 from ..netfp import probe_ip_region
 from ..settings import get_setting
+from ..platform_adapter import AdapterTaskRuntime
 from .downloader import Downloader
 
 MAX_AUTO_RETRY = 3
@@ -101,6 +96,10 @@ class MonitorEngine:
         self._last_acct_check = time.time()   # 上次账号体检时间
         self._geo_checked: dict = {}          # account_id -> 已校验过地区的代理(避免重复探测)
         self._task: Optional[asyncio.Task] = None
+        self.adapter_runtime = AdapterTaskRuntime(
+            user_agent=cfg.engine.user_agent,
+            request_timeout=cfg.engine.request_timeout_seconds,
+        )
         self._running = False
 
     def start(self):
@@ -238,20 +237,12 @@ class MonitorEngine:
                 async with self._account_guard(aid):
                     if platform == "xhs" and creator_state:
                         # 创作者号:用创作平台接口校验(www 的 user/me 对创作态会误判)
-                        chk = await creator_check(creator_state, proxy=proxy)
+                        chk = await self.adapter_runtime.xhs_creator_check(creator_state, proxy=proxy)
                         if chk is None:
                             continue                 # 不确定,保持原状态
                         u, err = ({"ok": 1}, "") if chk else ({}, "logged_out")
                     elif platform == "xhs":
-                        client = self._xhs_client(state, proxy)
-                        if client is None:
-                            u, err = {}, "logged_out"
-                        else:
-                            try:
-                                d = await client.self_info()
-                                u, err = (d, "") if (d and not d.get("guest")) else ({}, "logged_out")
-                            except XhsApiError:
-                                u, err = {}, "logged_out"
+                        u, err = await self.adapter_runtime.xhs_self_profile(state, proxy=proxy)
                     elif platform == "kuaishou":
                         u, err = await fetch_ks_self_profile(self.browser, identity)
                     elif platform == "shipinhao":
@@ -266,7 +257,7 @@ class MonitorEngine:
                     continue
                 if u:
                     if platform == "xhs":
-                        p = parse_xhs_self_user(u)
+                        p = self.adapter_runtime.parse_xhs_self_user(u)
                     elif platform == "kuaishou":
                         p = parse_ks_self_user(u)
                     elif platform == "shipinhao":
@@ -639,66 +630,31 @@ class MonitorEngine:
                 "download_dir", self.cfg.engine.media_dir)
 
         # 小红书签名直连需要登录态里的 a1 / web_session 等 Cookie
-        cookie_str = cookie_str_from_state(state)
-        if not state or not has_a1(cookie_str):
-            msg = "小红书监控需要绑定一个已登录的小红书账号(登录态缺少 a1,请重新扫码登录)"
+        scan = await self.adapter_runtime.scan_xhs_contents(
+            state=state,
+            proxy=proxy,
+            kind=kind,
+            keyword=keyword,
+            user_id=user_id,
+            xsec_token=xsec_token,
+            known_ids=known,
+            max_per_scan=12,
+            inter_item_delay=0.6,
+        )
+        if scan.auth_error:
             with get_session() as s:
                 t = s.get(MonitorTarget, target_id)
                 if t:
                     t.last_scan_at = datetime.utcnow()
-                    t.last_error = msg
+                    t.last_error = scan.error
                     s.add(t); s.commit()
-            return {"ok": False, "new": 0, "error": msg}
+            return {"ok": False, "new": 0, "error": scan.error}
 
-        client = XhsApiClient(cookie_str, self.cfg.engine.user_agent,
-                              timeout=self.cfg.engine.request_timeout_seconds, proxy=proxy)
-        error = ""
-        author = None
-        briefs_raw: list = []
-        try:
-            if kind == "keyword":
-                briefs_raw = await client.search_notes(keyword)
-            else:
-                d = await client.notes_by_creator(user_id, xsec_token=xsec_token)
-                briefs_raw = d.get("notes") or []
-                try:
-                    author = await client.user_info(user_id)
-                except Exception:
-                    author = None
-        except XhsApiError as e:
-            error = str(e)
-        except Exception as e:
-            error = f"小红书接口请求失败: {e!r}"
-
-        # 逐条新笔记调 feed 接口拿完整媒体直链(单轮限量,避免请求过多被风控)
+        error = scan.error
+        author = scan.author
         new_records = []
-        seen = set()
-        MAX_PER_SCAN = 12
-        for raw in briefs_raw:
-            brief = parse_note_brief(raw)
-            if not brief or brief["note_id"] in seen or brief["note_id"] in known:
-                continue
-            seen.add(brief["note_id"])
-            if len(new_records) >= MAX_PER_SCAN:
-                break
-            if seen and len(seen) > 1:
-                await asyncio.sleep(0.6)   # 给 feed 接口留间隔,降低被风控/限流的概率
-            note_tok = brief.get("xsec_token", "")
-            derr = ""
-            card = {}
-            try:
-                card = await client.note_detail(
-                    brief["note_id"], xsec_token=note_tok,
-                    xsec_source="pc_search" if kind == "keyword" else "pc_feed")
-            except Exception as e:
-                derr = str(e)
-            aw = parse_note_detail(card or {}, brief) if card else None
-            if not aw:
-                # 详情抓取失败也建一条 failed 记录,保留 xsec_token 便于重试
-                aw = Aweme(aweme_id=brief["note_id"], desc=brief.get("title", ""),
-                           create_time=0, author_name="", media_type="images")
-                aw.platform = "xhs"
-                aw.cover = brief.get("cover", "")
+        for item in scan.items:
+            aw = item.aweme
             media_json = json.dumps([{"url": m.url, "kind": m.kind, "ext": m.ext,
                                       "index": m.index} for m in aw.medias])
             rec = ContentRecord(
@@ -706,13 +662,13 @@ class MonitorEngine:
                 media_type=aw.media_type, quality=aw.quality_label,
                 create_time=aw.create_time, cover_url=aw.cover or "",
                 like_count=aw.like_count, comment_count=aw.comment_count,
-                duration=aw.duration, media_json=media_json, xsec_token=note_tok,
+                duration=aw.duration, media_json=media_json, xsec_token=item.xsec_token,
                 download_status="pending" if aw.medias else "failed",
-                error="" if aw.medias else (derr or "未取到媒体直链"),
+                error="" if aw.medias else (item.error or "未取到媒体直链"),
             )
             new_records.append((rec, aw))
 
-        print(f"[xhs_scan] kind={kind} key={keyword or user_id} briefs={len(briefs_raw)} "
+        print(f"[xhs_scan] kind={kind} key={keyword or user_id} briefs={scan.raw_count} "
               f"new_records={len(new_records)} "
               f"with_media={sum(1 for _, a in new_records if a.medias)} error={error!r}")
 
@@ -725,7 +681,7 @@ class MonitorEngine:
                 t.last_scan_at = datetime.utcnow()
                 t.last_error = error
                 if author:  # 创作者资料(otherinfo)
-                    p = parse_xhs_self_user(author)
+                    p = self.adapter_runtime.parse_xhs_self_user(author)
                     if not t.nickname:
                         t.nickname = p.get("nickname") or t.nickname
                     if not t.avatar:
@@ -1109,32 +1065,19 @@ class MonitorEngine:
 
     # ── 小红书评论监控(签名直连 API)──
     def _xhs_client(self, state: str, proxy: str = ""):
-        cookie_str = cookie_str_from_state(state)
-        if not has_a1(cookie_str):
-            return None
-        return XhsApiClient(cookie_str, self.cfg.engine.user_agent,
-                            timeout=self.cfg.engine.request_timeout_seconds, proxy=proxy)
+        return self.adapter_runtime.xhs_client_from_state(state, proxy)
 
     async def _xhs_fetch_comments(self, client, note_id, xsec_token, known) -> list:
-        try:
-            d = await client.note_comments(note_id, xsec_token=xsec_token)
-            raw = d.get("comments") or []
-        except Exception as e:
-            log.info("评论监控(小红书)%s: %s", note_id, e)
-            return []
-        fresh = [c for c in (parse_xhs_comment(rc) for rc in flatten_xhs_comments(raw)) if c]
-        return [c for c in fresh if c["comment_id"] not in known]
+        return await self.adapter_runtime.xhs_fetch_comments(client, note_id, xsec_token, known)
 
     async def _cw_xhs_note(self, watch_id, state, note_id, xsec_token, name, first_scan,
                            proxy=""):
-        client = self._xhs_client(state, proxy)
-        if client is None:
-            return 0, None
         with get_session() as s:
             known = set(s.exec(select(CommentRecord.comment_id)
                                .where(CommentRecord.watch_id == watch_id)
                                .where(CommentRecord.aweme_id == note_id)).all())
-        fresh = await self._xhs_fetch_comments(client, note_id, xsec_token, known)
+        fresh = await self.adapter_runtime.xhs_fetch_comments_from_state(
+            state, proxy, note_id, xsec_token, known)
         n = await self._ingest(watch_id, note_id, fresh, name, name, first_scan,
                                platform="xhs")
         return n, None
@@ -1142,29 +1085,24 @@ class MonitorEngine:
     async def _cw_xhs_creator(self, watch_id, state, user_id, xsec_token, name, first_scan,
                               proxy=""):
         cfg = self.cfg.engine
-        client = self._xhs_client(state, proxy)
-        if client is None:
+        batch = await self.adapter_runtime.xhs_creator_briefs(
+            state, proxy, user_id, xsec_token, cfg.comment_recent_works)
+        if batch.auth_error:
             return 0, None
-        try:
-            d = await client.notes_by_creator(user_id, xsec_token=xsec_token)
-            briefs_raw = d.get("notes") or []
-            author = await client.user_info(user_id)
-        except Exception as e:
-            log.info("评论监控(小红书创作者)%s: %s", user_id, e)
-            briefs_raw, author = [], None
-        briefs = [b for b in (parse_note_brief(r) for r in briefs_raw) if b]
-        briefs = briefs[:cfg.comment_recent_works]
+        if batch.error:
+            log.info("评论监控(小红书创作者)%s: %s", user_id, batch.error)
         total = 0
-        for b in briefs:
+        for b in batch.briefs:
             nid = b["note_id"]
             with get_session() as s:
                 known = set(s.exec(select(CommentRecord.comment_id)
                                    .where(CommentRecord.watch_id == watch_id)
                                    .where(CommentRecord.aweme_id == nid)).all())
-            fresh = await self._xhs_fetch_comments(client, nid, b.get("xsec_token", ""), known)
+            fresh = await self.adapter_runtime.xhs_fetch_comments_from_state(
+                state, proxy, nid, b.get("xsec_token", ""), known)
             total += await self._ingest(watch_id, nid, fresh, name, b.get("title", ""),
                                         first_scan, platform="xhs")
-        author_dict = parse_xhs_self_user(author) if author else None
+        author_dict = self.adapter_runtime.parse_xhs_self_user(batch.author) if batch.author else None
         return total, ({"nickname": author_dict["nickname"],
                         "avatar_thumb": {"url_list": [author_dict["avatar"]]}}
                        if author_dict else None)
@@ -1327,9 +1265,9 @@ class MonitorEngine:
                 task_id, False, "", "该账号未完成小红书「创作者登录」,请先在账号页点「创作者登录」")
 
         try:
-            ok, url, err = await publish_xhs(self.browser, identity, state, media_type,
-                                             title, desc, files, topics=topics,
-                                             headed=True)
+            ok, url, err = await self.adapter_runtime.publish_xhs(
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, headed=True)
         except Exception as e:
             ok, url, err = False, "", f"发布异常: {e!r}"
         return await self._finish_publish(task_id, ok, url, err)
@@ -1614,54 +1552,12 @@ class MonitorEngine:
         cands: list = []
         # ── 小红书:签名直连 ──
         if platform == "xhs":
-            client = self._xhs_client(state, proxy)
-            if client is None:
-                return [], "账号登录态缺少 a1,请重新扫码登录"
-            if mode == "auto_comment":
-                if kind == "keyword":
-                    raw = await client.search_notes(rf["keyword"])
-                else:   # creator
-                    d = await client.notes_by_creator(rf["sec_uid"], xsec_token=rf["xsec_token"])
-                    raw = d.get("notes") or []
-                for it in raw:
-                    b = parse_note_brief(it)
-                    if not b:
-                        continue
-                    cands.append({"aweme_id": b["note_id"],
-                                  "xsec_token": b.get("xsec_token", ""),
-                                  "target_comment_id": "", "target_nick": "",
-                                  "ctx": {"kw": rf["keyword"]},
-                                  "source_text": b.get("title", "")})
-            else:   # auto_reply:回复自己作品的评论
-                notes = []
-                if kind == "work" and rf["aweme_id"]:
-                    notes = [{"note_id": rf["aweme_id"], "xsec_token": rf["xsec_token"]}]
-                else:
-                    d = await client.notes_by_creator(acc_sec_uid, xsec_token=rf["xsec_token"])
-                    for it in (d.get("notes") or [])[:self.cfg.engine.comment_recent_works]:
-                        b = parse_note_brief(it)
-                        if b:
-                            notes.append({"note_id": b["note_id"],
-                                          "xsec_token": b.get("xsec_token", "")})
-                for nt in notes:
-                    try:
-                        d = await client.note_comments(nt["note_id"], xsec_token=nt["xsec_token"])
-                        rawc = d.get("comments") or []
-                    except Exception:
-                        continue
-                    for rc in flatten_xhs_comments(rawc):
-                        c = parse_xhs_comment(rc)
-                        if not c or not c.get("comment_id"):
-                            continue
-                        if c.get("user_nickname") and c["user_nickname"] == acc_nick:
-                            continue   # 不回复自己
-                        cands.append({"aweme_id": nt["note_id"],
-                                      "xsec_token": nt["xsec_token"],
-                                      "target_comment_id": c["comment_id"],
-                                      "target_nick": c.get("user_nickname", ""),
-                                      "ctx": {"nick": c.get("user_nickname", "")},
-                                      "source_text": c.get("text", "")})
-            return cands, ""
+            return await self.adapter_runtime.discover_xhs_comment_targets(
+                state=state, proxy=proxy, mode=mode, kind=kind,
+                keyword=rf["keyword"], target_user_id=rf["sec_uid"],
+                target_note_id=rf["aweme_id"], target_xsec_token=rf["xsec_token"],
+                account_user_id=acc_sec_uid, account_nick=acc_nick,
+                recent_works=self.cfg.engine.comment_recent_works)
         # ── 快手:浏览器自动化(拦截 GraphQL,与抖音同范式)──
         if platform == "kuaishou":
             if mode == "auto_comment":
@@ -2000,14 +1896,9 @@ class MonitorEngine:
         try:
             if platform == "xhs":
                 method = "api"
-                client = self._xhs_client(state, proxy)
-                if client is None:
-                    err = "账号登录态缺少 a1,请重新扫码登录"
-                else:
-                    d = await client.post_comment(aweme_id, content, xsec_token=xsec_token,
-                                                  target_comment_id=target_cid)
-                    cid = (d.get("comment") or {}).get("id") if isinstance(d, dict) else ""
-                    ok, result = True, (cid or "ok")
+                ok, result, err = await self.adapter_runtime.post_xhs_comment(
+                    state, proxy, aweme_id, content, xsec_token=xsec_token,
+                    target_comment_id=target_cid)
             elif platform == "kuaishou":
                 method = "browser"
                 ok, err = await post_ks_comment(
@@ -2153,19 +2044,11 @@ class MonitorEngine:
 
         # 小红书:无媒体快照时,重新拉详情补齐媒体直链
         if platform == "xhs" and (not media_json or not aw.medias):
-            client = self._xhs_client(acc_state, acc_proxy)
-            derr = "" if client else "账号登录态缺少 a1,请重新扫码登录"
-            card = {}
-            if client:
-                try:
-                    card = await client.note_detail(
-                        note_id, xsec_token=note_tok,
-                        xsec_source="pc_search" if kind == "keyword" else "pc_feed")
-                except Exception as e:
-                    derr = str(e)
-            aw2 = parse_note_detail(card or {}, {"note_id": note_id}) if card else None
-            if aw2 and aw2.medias:
-                aw = aw2
+            refreshed = await self.adapter_runtime.refresh_xhs_media(
+                state=acc_state, proxy=acc_proxy, note_id=note_id,
+                xsec_token=note_tok, kind=kind)
+            if refreshed.aweme and refreshed.aweme.medias:
+                aw = refreshed.aweme
                 with get_session() as s:
                     rec = s.get(ContentRecord, record_id)
                     if rec:
@@ -2182,9 +2065,9 @@ class MonitorEngine:
                     rec = s.get(ContentRecord, record_id)
                     if rec:
                         rec.download_status = "failed"
-                        rec.error = derr or "重拉详情仍无媒体(笔记可能已删/私密)"
+                        rec.error = refreshed.error or "重拉详情仍无媒体(笔记可能已删/私密)"
                         s.add(rec); s.commit()
-                return {"ok": False, "error": derr or "重拉详情仍无媒体"}
+                return {"ok": False, "error": refreshed.error or "重拉详情仍无媒体"}
         elif not media_json or not aw.medias:
             with get_session() as s:
                 rec = s.get(ContentRecord, record_id)

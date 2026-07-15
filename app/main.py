@@ -30,12 +30,6 @@ from .platforms.douyin import parse_self_user
 from .config import load_config
 from .db import get_session, init_db
 from .platforms.douyin import resolve_sec_uid, resolve_aweme_id, looks_like_video
-from .platforms.xhs import (resolve_note as xhs_resolve_note,
-                  resolve_user as xhs_resolve_user,
-                  looks_like_note as xhs_looks_like_note,
-                  parse_self_user as parse_xhs_self_user,
-                  XhsApiClient, XhsApiError, cookie_str_from_state, has_a1,
-                  has_creator_cookies)
 from .platforms.kuaishou import (resolve_ks_user_id, resolve_ks_photo_id,
                   looks_like_photo as ks_looks_like_photo,
                   parse_self_user as parse_ks_self_user)
@@ -50,6 +44,7 @@ from .notifier import CHANNEL_TYPES, send_one
 from .profiles import (ensure_identity, migrate_identities, assign_proxy_from_pool,
                        seed_proxy_pool)
 from .settings import get_setting, set_setting
+from .platform_adapter import default_registry
 
 import json
 
@@ -102,30 +97,13 @@ WEB_DIR = Path(__file__).parent / "web"
 
 # ─────────── 扫码登录(真实浏览器) ───────────
 async def _xhs_profile(state: str, proxy: str = ""):
-    """用签名直连 API 拿小红书账号资料(me 身份 + otherinfo 昵称/头像/粉丝)。
-    返回 (user dict, error)。error == "logged_out" 表示登录态失效。"""
-    cookie_str = cookie_str_from_state(state)
-    if not has_a1(cookie_str):
-        return {}, "logged_out"
-    client = XhsApiClient(cookie_str, cfg.engine.user_agent,
-                          timeout=cfg.engine.request_timeout_seconds, proxy=proxy)
-    try:
-        me = await client.self_info()
-    except XhsApiError:
-        return {}, "logged_out"
-    except Exception as e:
-        print(f"[xhs_profile] self_info 失败: {e!r}")
-        return {}, "error"
-    if not me or me.get("guest") is True or not me.get("user_id"):
-        return {}, "logged_out"
-    merged = dict(me)
-    try:
-        other = await client.user_info(me["user_id"])
-        if other:
-            merged = {**other, **me}      # me 提供身份,otherinfo 提供 basic_info/粉丝
-    except Exception:
-        pass
-    return merged, ""
+    """用 adapter 拿小红书账号资料(me 身份 + otherinfo 昵称/头像/粉丝)。"""
+    adapter = default_registry.get("xhs")
+    return await adapter.self_profile(
+        state, cfg.engine.user_agent,
+        timeout=cfg.engine.request_timeout_seconds,
+        proxy=proxy,
+    )
 
 
 async def _enrich_account_profile(account_id: int, state: str) -> str:
@@ -141,8 +119,8 @@ async def _enrich_account_profile(account_id: int, state: str) -> str:
 
     # XHS 创作者号:用创作平台「我的信息」拿资料 + 判活(www 接口对创作态拿不到)
     if platform == "xhs" and creator_state:
-        from .platforms.xhs import creator_profile, creator_check
-        prof = await creator_profile(creator_state, proxy=proxy)
+        adapter = default_registry.get("xhs")
+        prof = await adapter.creator_profile(creator_state, proxy=proxy)
         if prof and (prof.get("nickname") or prof.get("douyin_id")):
             with get_session() as s:
                 acc = s.get(DouyinAccount, account_id)
@@ -157,7 +135,7 @@ async def _enrich_account_profile(account_id: int, state: str) -> str:
                     acc.status = "active"
                     s.add(acc); s.commit()
             return "ok"
-        chk = await creator_check(creator_state, proxy=proxy)
+        chk = await adapter.creator_check(creator_state, proxy=proxy)
         if chk is True:
             with get_session() as s:
                 acc = s.get(DouyinAccount, account_id)
@@ -191,7 +169,7 @@ async def _enrich_account_profile(account_id: int, state: str) -> str:
             return "error"
         if u:
             if platform == "xhs":
-                p = parse_xhs_self_user(u)
+                p = default_registry.get("xhs").parse_self_user(u)
             elif platform == "kuaishou":
                 p = parse_ks_self_user(u)
             elif platform == "shipinhao":
@@ -466,8 +444,8 @@ async def list_accounts(platform: str | None = None):
                 "id": a.id, "platform": a.platform, "nickname": a.nickname, "status": a.status,
                 "sec_uid": a.sec_uid, "douyin_id": a.douyin_id, "avatar": a.avatar,
                 "follower_count": a.follower_count, "aweme_count": a.aweme_count,
-                "has_creator": bool(a.creator_storage_state) or has_creator_cookies(a.storage_state),
-                "kind": "creator" if (a.creator_storage_state or has_creator_cookies(a.storage_state)) else "fetch",
+                "has_creator": _xhs_has_creator_state(a),
+                "kind": "creator" if _xhs_has_creator_state(a) else "fetch",
                 "has_storage": bool(a.storage_state),
                 "login_type": "cookie" if a.cookie else "scan",
                 "monitor_count": used,
@@ -1578,6 +1556,32 @@ def _settings_dict() -> dict:
     }
 
 
+@app.get("/api/platform-adapters/capabilities")
+async def platform_adapter_capabilities():
+    """返回统一平台能力矩阵,供生产平台按 capability 而不是按平台分支编排。"""
+    return {"adapters": [r.to_dict() for r in default_registry.capability_records()]}
+
+
+class ResolveTargetIn(BaseModel):
+    input: str
+    target_kind: str = "auto"
+
+
+@app.post("/api/platform-adapters/{platform}/resolve-target")
+async def platform_adapter_resolve_target(platform: str, body: ResolveTargetIn):
+    """通过 adapter registry 解析平台目标,避免 API 层继续扩散平台分支。"""
+    if not default_registry.has(platform):
+        raise HTTPException(404, "未知平台")
+    adapter = default_registry.get(platform)
+    if not hasattr(adapter, "resolve_target"):
+        raise HTTPException(400, "该平台暂未接入目标解析 adapter")
+    try:
+        ref = await adapter.resolve_target(body.input, body.target_kind, cfg.engine.user_agent)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return ref.to_dict()
+
+
 @app.get("/api/settings")
 async def get_settings():
     return _settings_dict()
@@ -1672,15 +1676,18 @@ async def add_monitor(body: TargetIn):
     kind = "creator"
 
     if platform == "xhs" and body.target_kind == "keyword":
+        adapter = default_registry.get("xhs")
+        ref = await adapter.resolve_target(body.url_or_secuid, "keyword", cfg.engine.user_agent)
         kind = "keyword"
-        keyword = body.url_or_secuid.strip()
-        if not keyword:
-            raise HTTPException(400, "请输入要监控的搜索关键词")
+        keyword = ref.platform_target_id
     elif platform == "xhs":
-        ref = await xhs_resolve_user(body.url_or_secuid, cfg.engine.user_agent)
-        if not ref:
+        adapter = default_registry.get("xhs")
+        try:
+            ref = await adapter.resolve_target(body.url_or_secuid, "creator", cfg.engine.user_agent)
+        except ValueError:
             raise HTTPException(400, "无法解析小红书 user_id,请粘贴创作者主页链接 / xhslink 短链 / 24 位 user_id")
-        sec_uid, xsec_token = ref.user_id, ref.xsec_token
+        sec_uid = ref.platform_target_id
+        xsec_token = ref.platform_extra.get("xsec_token", "")
     elif platform == "kuaishou":
         sec_uid = await resolve_ks_user_id(body.url_or_secuid, cfg.engine.user_agent)
         if not sec_uid:
@@ -1749,7 +1756,7 @@ async def update_monitor(tid: int, body: TargetUpdate):
                 acc = s.get(DouyinAccount, body.relay_to_xhs_account_id)
                 if not acc or acc.platform != "xhs":
                     raise HTTPException(400, "转发目标须为已登录的小红书账号")
-                if not (acc.creator_storage_state or has_creator_cookies(acc.storage_state)):
+                if not _xhs_has_creator_state(acc):
                     raise HTTPException(400, "转发目标账号不可发布:请对该号完成「小红书扫码登录」或「创作者登录」")
                 t.relay_to_xhs_account_id = body.relay_to_xhs_account_id
             else:
@@ -1997,20 +2004,30 @@ async def add_watch(body: WatchIn):
     title = ""
 
     if platform == "xhs":
+        adapter = default_registry.get("xhs")
         kind = body.kind
         if kind == "auto":
-            kind = "video" if xhs_looks_like_note(body.url_or_id) else "user"
+            try:
+                ref = await adapter.resolve_target(body.url_or_id, "auto", cfg.engine.user_agent)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            kind = "video" if ref.target_kind == "content" else "user"
+        else:
+            resolve_kind = "note" if kind == "video" else "creator"
+            try:
+                ref = await adapter.resolve_target(body.url_or_id, resolve_kind, cfg.engine.user_agent)
+            except ValueError:
+                msg = ("无法解析小红书笔记,请粘贴 explore 笔记链接 / xhslink 短链 / 24 位 note_id"
+                       if kind == "video" else
+                       "无法解析小红书创作者,请粘贴主页链接 / xhslink 短链 / 24 位 user_id")
+                raise HTTPException(400, msg)
         if kind == "video":
-            ref = await xhs_resolve_note(body.url_or_id, cfg.engine.user_agent)
-            if not ref:
-                raise HTTPException(400, "无法解析小红书笔记,请粘贴 explore 笔记链接 / xhslink 短链 / 24 位 note_id")
-            aweme_id, xsec_token = ref.note_id, ref.xsec_token
+            aweme_id = ref.platform_target_id
+            xsec_token = ref.platform_extra.get("xsec_token", "")
             title = "笔记 " + aweme_id
         else:
-            ref = await xhs_resolve_user(body.url_or_id, cfg.engine.user_agent)
-            if not ref:
-                raise HTTPException(400, "无法解析小红书创作者,请粘贴主页链接 / xhslink 短链 / 24 位 user_id")
-            sec_uid, xsec_token = ref.user_id, ref.xsec_token
+            sec_uid = ref.platform_target_id
+            xsec_token = ref.platform_extra.get("xsec_token", "")
         mode = "public"
     elif platform == "kuaishou":
         kind = body.kind
@@ -2243,7 +2260,7 @@ async def add_publish(body: PublishIn):
             # 抖音 / 快手 / 视频号发布走浏览器自动化,登录态在该账号持久 profile 里
             if not (acc.creator_storage_state or acc.storage_state):
                 raise HTTPException(400, f"该{pname}账号不可发布:请先在账号页完成登录")
-        elif not (acc.creator_storage_state or has_creator_cookies(acc.storage_state)):
+        elif not _xhs_has_creator_state(acc):
             raise HTTPException(400, "该账号不可发布:请对该号完成「小红书扫码登录」或「创作者登录」")
         vis = body.visibility if body.visibility in ("public", "friends", "private") else "public"
         t = PublishTask(
@@ -2273,41 +2290,17 @@ async def del_publish(tid: int):
     return {"ok": True}
 
 
-def _first_val(d: dict, *keys, default=""):
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, "", 0, []):
-            return v
-    return default
+def _xhs_has_creator_state(acc: DouyinAccount) -> bool:
+    return bool(acc.creator_storage_state) or default_registry.get("xhs").has_creator_cookies(acc.storage_state)
 
 
 async def _xhs_account_uid(state: str, proxy: str = "") -> str:
     """拿到该账号自己的 user_id(self_info → 创作平台资料兜底)。"""
-    from .platforms.xhs import XhsApiClient, cookie_str_from_state, has_a1, creator_profile
-    cookie = cookie_str_from_state(state)
-    if has_a1(cookie):
-        try:
-            client = XhsApiClient(cookie, cfg.engine.user_agent,
-                                  timeout=cfg.engine.request_timeout_seconds, proxy=proxy)
-            me = await client.self_info()
-            uid = str((me or {}).get("user_id") or "")
-            if uid:
-                return uid
-        except Exception:
-            pass
-    prof = await creator_profile(state, proxy=proxy)
-    return (prof or {}).get("sec_uid") or ""
-
-
-def _imgs_of(n: dict) -> list:
-    out = []
-    for it in (n.get("images_list") or n.get("imageList") or []):
-        if isinstance(it, dict):
-            u = it.get("url") or it.get("url_default") or it.get("urlDefault") or ""
-            if u:
-                out.append(u)
-    return out
-
+    return await default_registry.get("xhs").account_user_id(
+        state, cfg.engine.user_agent,
+        timeout=cfg.engine.request_timeout_seconds,
+        proxy=proxy,
+    )
 
 @app.get("/api/publish/published")
 async def list_published_notes(account_id: int):
@@ -2327,45 +2320,20 @@ async def list_published_notes(account_id: int):
         if not (read_state or creator_state):
             raise HTTPException(400, "该账号未登录,请先在账号页扫码登录")
     from .browser import fetch_xhs_notes, fetch_creator_published
-    from .platforms.xhs import parse_note_brief
 
+    xhs_adapter = default_registry.get("xhs")
     out, good = [], False
     if read_state:
         uid = await _xhs_account_uid(read_state, proxy)
         if uid:
             items, _a, _e = await fetch_xhs_notes(browser, identity, uid, set())
-            for raw in items[:80]:
-                b = parse_note_brief(raw)
-                if not b:
-                    continue
-                card = raw.get("note_card") or raw
-                interact = card.get("interact_info") or {}
-                out.append({
-                    "note_id": b["note_id"], "title": b.get("title") or "(无标题)",
-                    "type": b.get("type") or "normal", "cover": b.get("cover") or "",
-                    "images": [], "like": interact.get("liked_count") or 0,
-                    "time": card.get("time") or 0,
-                    "xsec_token": b.get("xsec_token") or "", "xsec_source": "pc_feed",
-                })
+            out = xhs_adapter.published_from_read_items(items, limit=80)
             good = bool(out)
     if not out:   # 回退:创作平台笔记管理(显示用)
         notes, err = await fetch_creator_published(browser, identity)
         if "logged_out" in (err or ""):
             raise HTTPException(400, "登录态已失效,请对该账号点「重新登录」")
-        for n in notes[:80]:
-            imgs = _imgs_of(n)
-            vi = n.get("video_info") or {}
-            cover = imgs[0] if imgs else (vi.get("cover") if isinstance(vi, dict) else "")
-            out.append({
-                "note_id": str(_first_val(n, "id", "noteId", "note_id")),
-                "title": _first_val(n, "display_title", "title", "desc", default="(无标题)"),
-                "type": _first_val(n, "type", "noteType", default="normal"),
-                "cover": cover or "", "images": imgs,
-                "like": _first_val(n, "likes", "likeCount", default=0),
-                "time": _first_val(n, "time", "postTime", default=0),
-                "xsec_token": _first_val(n, "xsec_token", default=""),
-                "xsec_source": _first_val(n, "xsec_source", default="pc_note_detail"),
-            })
+        out = xhs_adapter.published_from_creator_notes(notes, limit=80)
     return {"notes": out, "total": len(out), "good_tokens": good}
 
 
@@ -2373,66 +2341,41 @@ async def list_published_notes(account_id: int):
 async def publish_note_media(account_id: int, note_id: str,
                              xsec_token: str = "", xsec_source: str = "pc_note_detail"):
     """取一条小红书笔记的完整媒体(图集/视频),供「已发布作品」预览。"""
-    from .platforms.xhs import XhsApiClient, XhsApiError, cookie_str_from_state, has_a1, parse_note_detail
     with get_session() as s:
         acc = s.get(DouyinAccount, account_id)
         if not acc or acc.platform != "xhs":
             raise HTTPException(400, "账号无效")
         state = acc.storage_state or acc.creator_storage_state or ""
         proxy = acc.proxy or ""
-    cookie = cookie_str_from_state(state)
-    if not has_a1(cookie):
-        raise HTTPException(400, "登录态缺少 a1")
-    client = XhsApiClient(cookie, cfg.engine.user_agent,
-                          timeout=cfg.engine.request_timeout_seconds, proxy=proxy)
+    xhs_adapter = default_registry.get("xhs")
     try:
-        card = await client.note_detail(note_id, xsec_token=xsec_token, xsec_source=xsec_source)
-    except XhsApiError as e:
-        raise HTTPException(400, f"取笔记失败:{e}")
-    aw = parse_note_detail(card or {}, {"note_id": note_id})
-    if not aw or not aw.medias:
+        payload = await xhs_adapter.note_media_payload_from_state(
+            state, cfg.engine.user_agent, cfg.engine.request_timeout_seconds,
+            proxy, note_id, xsec_token=xsec_token, xsec_source=xsec_source)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not payload:
         raise HTTPException(400, "拿不到该笔记的媒体(xsec_token 对 feed 接口无效)")
-    return {
-        "media_type": aw.media_type, "desc": aw.desc, "cover_url": aw.cover or "",
-        "medias": [{"url": m.url, "kind": m.kind, "ext": m.ext, "index": m.index}
-                   for m in aw.medias],
-    }
+    return payload
 
 
 @app.get("/api/publish/note-comments")
 async def publish_note_comments(account_id: int, note_id: str,
                                 xsec_token: str = "", xsec_source: str = "pc_note_detail"):
     """拉取一条小红书笔记的评论(一级 + 子评论拍平)。"""
-    from .platforms.xhs import (XhsApiClient, XhsApiError, cookie_str_from_state, has_a1,
-                      parse_comment as parse_xhs_comment, flatten_comments)
     with get_session() as s:
         acc = s.get(DouyinAccount, account_id)
         if not acc or acc.platform != "xhs":
             raise HTTPException(400, "账号无效")
         state = acc.storage_state or acc.creator_storage_state or ""
         proxy = acc.proxy or ""
-    cookie = cookie_str_from_state(state)
-    if not has_a1(cookie):
-        raise HTTPException(400, "登录态缺少 a1")
-    client = XhsApiClient(cookie, cfg.engine.user_agent,
-                          timeout=cfg.engine.request_timeout_seconds, proxy=proxy)
-    # 评论接口要 pc_feed 令牌;先调 feed 拿一个新鲜令牌(feed 接受 pc_creatormng 令牌)
-    tok, src = xsec_token, xsec_source
+    xhs_adapter = default_registry.get("xhs")
     try:
-        item = await client.note_detail_raw(note_id, xsec_token=xsec_token, xsec_source=xsec_source)
-        fresh = item.get("xsec_token") or ((item.get("note_card") or {}).get("xsec_token"))
-        if fresh:
-            tok, src = fresh, "pc_feed"
-    except Exception:
-        pass
-    try:
-        d = await client.note_comments(note_id, xsec_token=tok, xsec_source=src)
-    except XhsApiError as e:
-        raise HTTPException(400, f"取评论失败:{e}")
-    raw = d.get("comments") or []
-    fresh = [c for c in (parse_xhs_comment(rc) for rc in flatten_comments(raw)) if c]
-    fresh.sort(key=lambda c: c.get("create_time") or 0, reverse=True)
-    return {"comments": fresh, "total": len(fresh), "has_more": bool(d.get("has_more"))}
+        return await xhs_adapter.note_comments_payload_from_state(
+            state, cfg.engine.user_agent, cfg.engine.request_timeout_seconds,
+            proxy, note_id, xsec_token=xsec_token, xsec_source=xsec_source)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 class RepostIn(BaseModel):
@@ -2466,7 +2409,7 @@ async def _repost_content(cid: int, body: RepostIn, target_platform: str):
             # 抖音发布走浏览器自动化,有任一登录态即可(需创作者/登录态)
             if not (acc.creator_storage_state or acc.storage_state):
                 raise HTTPException(400, "该抖音账号不可发布:请先在账号页完成「创作者登录」")
-        elif not (acc.creator_storage_state or has_creator_cookies(acc.storage_state)):
+        elif not _xhs_has_creator_state(acc):
             raise HTTPException(400, "该账号不可发布:请对该号完成「小红书扫码登录」或「创作者登录」")
     # 2) 退出会话后再创建发布任务(create_relay_publish 内部自开会话)
     #    若前端传了编辑后的标题/正文/话题,则用编辑值覆盖作品原始内容
@@ -2569,10 +2512,13 @@ async def _resolve_rule_target(platform: str, mode: str, target_kind: str, targe
                 raise HTTPException(400, f"{pn}暂不支持关键词发现,请用「创作者」模式")
         else:
             if platform == "xhs":
-                ref = await xhs_resolve_user(target, cfg.engine.user_agent)
-                if not ref:
+                adapter = default_registry.get("xhs")
+                try:
+                    ref = await adapter.resolve_target(target, "creator", cfg.engine.user_agent)
+                except ValueError:
                     raise HTTPException(400, "无法解析小红书创作者(主页链接 / xhslink / user_id)")
-                sec_uid, xsec_token = ref.user_id, ref.xsec_token
+                sec_uid = ref.platform_target_id
+                xsec_token = ref.platform_extra.get("xsec_token", "")
             elif platform == "kuaishou":
                 sec_uid = await resolve_ks_user_id(target, cfg.engine.user_agent)
                 if not sec_uid:
@@ -2585,10 +2531,13 @@ async def _resolve_rule_target(platform: str, mode: str, target_kind: str, targe
         kind = target_kind if target_kind in ("self", "work") else "self"
         if kind == "work":
             if platform == "xhs":
-                ref = await xhs_resolve_note(target, cfg.engine.user_agent)
-                if not ref:
+                adapter = default_registry.get("xhs")
+                try:
+                    ref = await adapter.resolve_target(target, "note", cfg.engine.user_agent)
+                except ValueError:
                     raise HTTPException(400, "无法解析小红书笔记(explore 链接 / xhslink / note_id)")
-                aweme_id, xsec_token = ref.note_id, ref.xsec_token
+                aweme_id = ref.platform_target_id
+                xsec_token = ref.platform_extra.get("xsec_token", "")
             elif platform == "kuaishou":
                 aweme_id = await resolve_ks_photo_id(target, cfg.engine.user_agent)
                 if not aweme_id:
