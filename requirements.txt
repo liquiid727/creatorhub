@@ -12,3 +12,4 @@ opencv-python-headless>=4.8  # 发布:图片尺寸 / 视频封面与元数据
 numpy>=1.24               # opencv 依赖
 
 websockets>=12
+cryptography>=43.0

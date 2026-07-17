@@ -485,6 +485,7 @@ function switchTab(name) {
   });
   try { localStorage.setItem("dym-tab", name); } catch (e) {}
   if (name === "hub") { refreshHubSummary(); refreshHubPanel(); }
+  if (name === "wechat") { refreshWechatAccounts(); }
   else stopDmStream();   // 离开本账号管理即断开私信实时流
 }
 
@@ -2536,6 +2537,74 @@ async function delTask(id) {
 
 function esc(s) { return (s || "").toString().replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
+// ─── 公众号官方 API 工作台(RP-003 / RP-004 / RP-005)───
+let WX_ACCOUNTS = [];
+function wxId() { return +((($("wx-account") || {}).value) || 0); }
+function wxMsg(text, type = "info") { const el = $("wx-msg"); if (el) { el.textContent = text; el.style.color = type === "err" ? "var(--danger)" : ""; } }
+function wxDates() {
+  const end = $("wx-end"), begin = $("wx-begin"), now = new Date(), before = new Date(now.getTime() - 6 * 86400000);
+  if (end && !end.value) end.value = now.toISOString().slice(0, 10);
+  if (begin && !begin.value) begin.value = before.toISOString().slice(0, 10);
+}
+async function refreshWechatAccounts() {
+  if (!$("wx-account")) return;
+  try {
+    WX_ACCOUNTS = await api("/api/accounts?platform=wechat_mp");
+    const sel = $("wx-account");
+    sel.innerHTML = WX_ACCOUNTS.length ? WX_ACCOUNTS.map(a => `<option value="${a.id}">${esc(a.nickname || "公众号 #" + a.id)} · ${esc(a.account_mode || "official")}</option>`).join("") : '<option value="">请先添加公众号</option>';
+    enhanceSelect(sel); csSyncAll(); wxDates(); await loadWechatAnalytics(); await loadWechatTasks();
+  } catch (e) { wxMsg("加载公众号失败: " + e.message, "err"); }
+}
+async function createWechatAccount() {
+  const nickname = $("wx-nickname").value.trim(), app_id = $("wx-app-id").value.trim(), app_secret = $("wx-app-secret").value;
+  if (!app_id || !app_secret) { wxMsg("AppID 和 AppSecret 不能为空", "err"); return; }
+  try {
+    const r = await api("/api/platform-adapters/wechat_mp/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ nickname, app_id, app_secret }) });
+    $("wx-app-secret").value = ""; $("wx-app-id").value = ""; $("wx-nickname").value = "";
+    wxMsg("公众号已添加，凭据已加密保存 ✓"); toast("公众号已添加", "ok"); await refreshWechatAccounts();
+    if (r.account_id) $("wx-account").value = String(r.account_id);
+  } catch (e) { wxMsg("添加失败: " + e.message, "err"); }
+}
+async function wxEnqueue(path, body, label) {
+  const account_id = wxId(); if (!account_id) { wxMsg("请先选择公众号", "err"); return null; }
+  try {
+    const r = await api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account_id, run_now: false, idempotency_key: `${path}-${account_id}-${Date.now()}`, ...body }) });
+    wxMsg(`${label}已入队，任务 #${r.id} · ${r.status}`); await loadWechatTasks(); return r;
+  } catch (e) { wxMsg(`${label}失败: ${e.message}`, "err"); return null; }
+}
+async function checkWechatAccount() { await wxEnqueue("/api/platform-adapters/wechat_mp/accounts/check", {}, "账号校验"); }
+async function syncWechatArticles() { await wxEnqueue("/api/platform-adapters/wechat_mp/contents/fetch", { count: 20 }, "文章同步"); }
+async function syncWechatMetrics() { wxDates(); await wxEnqueue("/api/platform-adapters/wechat_mp/analytics/sync", { begin_date: $("wx-begin").value, end_date: $("wx-end").value }, "数据同步"); }
+async function loadWechatAnalytics() {
+  if (!$("wx-analytics-table")) return; wxDates(); const id = wxId();
+  if (!id) { $("wx-analytics-table").innerHTML = empty(6, "请先添加公众号", "i-card"); return; }
+  try {
+    const rows = await api(`/api/platform-adapters/wechat_mp/accounts/${id}/analytics?begin_date=${$("wx-begin").value}&end_date=${$("wx-end").value}`);
+    $("wx-analytics-table").innerHTML = rows.map(r => `<tr><td>${esc(r.date)}</td><td class="num">${r.followers || 0}</td><td class="num">${r.articles || 0}</td><td class="num">${r.reads || 0}</td><td class="num">${r.shares || 0}</td><td class="num">${r.favorites || 0}</td></tr>`).join("") || empty(6, "暂无数据", "i-card", "先点击「同步数据」");
+  } catch (e) { $("wx-analytics-table").innerHTML = empty(6, "加载失败", "i-x", e.message); }
+}
+async function createWechatDraft() {
+  const article = { title: $("wx-draft-title").value.trim(), thumb_media_id: $("wx-draft-thumb").value.trim(), content: $("wx-draft-content").value, content_source_url: $("wx-draft-url").value.trim(), digest: "" };
+  const r = await wxEnqueue("/api/platform-adapters/wechat_mp/drafts", { article }, "草稿创建");
+  if (r && r.result && r.result.media_id) $("wx-publish-media").value = r.result.media_id;
+}
+async function publishWechatDraft() {
+  const media_id = $("wx-publish-media").value.trim(); if (!media_id) { $("wx-publish-msg").textContent = "请填写草稿 media_id"; return; }
+  const r = await wxEnqueue("/api/platform-adapters/wechat_mp/publish-tasks", { media_id }, "发布任务");
+  if (r) $("wx-publish-msg").textContent = "已进入审批队列，请在下方点击「通过审批」后执行";
+}
+async function loadWechatTasks() {
+  if (!$("wx-task-table")) return; const id = wxId(); if (!id) return;
+  try {
+    const rows = await api(`/api/runtime/tasks?account_id=${id}&limit=50`);
+    $("wx-task-table").innerHTML = rows.map(t => `<tr><td>${esc(t.task_type)} #${t.id}</td><td><span class="pill ${t.status === "succeeded" ? "done" : t.status === "failed" ? "invalid" : "pending"}">${esc(t.status)}</span></td><td>${t.attempts}/${t.max_attempts}</td><td>${t.requires_approval ? esc(t.approval_ref || "待审批") : "—"}</td><td class="wrap">${esc(t.error || "")}</td><td class="acttd">${t.status === "pending_approval" ? `<button class="sm" onclick="approveWechatTask(${t.id})">通过审批</button>` : ""}${["pending", "failed"].includes(t.status) ? `<button class="ghost sm" onclick="runWechatTask(${t.id})">立即执行</button>` : ""}</td></tr>`).join("") || empty(6, "暂无任务", "i-list");
+    const audit = await api(`/api/audit-events?account_id=${id}&limit=30`);
+    $("wx-audit-table").innerHTML = audit.map(a => `<tr><td class="mut">${new Date(a.occurred_at).toLocaleString()}</td><td>${esc(a.action)}</td><td>${esc(a.result)}</td><td>${esc(a.error_code || "")}</td></tr>`).join("") || empty(4, "暂无审计记录", "i-list");
+  } catch (e) { $("wx-task-table").innerHTML = empty(6, "任务加载失败", "i-x", e.message); }
+}
+async function approveWechatTask(id) { try { await api(`/api/runtime/tasks/${id}/approve`, { method: "POST" }); toast("审批已通过", "ok"); loadWechatTasks(); } catch (e) { toast("审批失败: " + e.message, "err"); } }
+async function runWechatTask(id) { try { await api(`/api/runtime/tasks/${id}/run-now`, { method: "POST" }); toast("任务已执行", "ok"); loadWechatTasks(); loadWechatAnalytics(); } catch (e) { toast("执行失败: " + e.message, "err"); } }
+
 function loop() {
   if (INFLIGHT > 0) return;   // 有慢操作进行中,别重渲染(保住按钮加载态)
   refreshMonitors(); refreshContents(); refreshWatches(); refreshComments(); refreshOverviewChart(); refreshCommentRules(); refreshCommentTasks(); if (pfHasPublish(PLATFORM)) refreshPublish();
@@ -2548,7 +2617,7 @@ $("watch-table").innerHTML = skeleton(8);
 $("comment-table").innerHTML = skeleton(6);
 
 // restore last-selected section (default: 总览);旧版四个独立页已并入「账号管理」
-const VALID_TABS = ["overview", "accounts", "monitors", "comments", "hub", "publish", "autocomment", "notifications", "settings"];
+const VALID_TABS = ["overview", "accounts", "monitors", "comments", "hub", "publish", "autocomment", "notifications", "settings", "wechat"];
 const LEGACY_HUB_TABS = ["myworks", "following", "fans", "dm"];
 switchTab((() => {
   try {

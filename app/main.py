@@ -39,12 +39,16 @@ from .models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                      CommentWatch, DouyinAccount, MonitorTarget,
                      NotificationChannel, ProxyPool, PublishTask,
                      AccountWork, FollowEdge, DmConversation, DmMessage,
-                     AccountActionTask, AccountStatSnapshot)
+                     AccountActionTask, AccountStatSnapshot,
+                     CredentialRefRecord, AuditEventRecord, RuntimeTaskRecord)
 from .notifier import CHANNEL_TYPES, send_one
 from .profiles import (ensure_identity, migrate_identities, assign_proxy_from_pool,
                        seed_proxy_pool)
 from .settings import get_setting, set_setting
 from .platform_adapter import default_registry
+from .security import CredentialStore
+from .task_runtime import TaskRuntime, TaskRuntimeError
+from .services.wechat_mp import WechatMpService
 
 import json
 
@@ -55,12 +59,58 @@ im_receiver = None      # ImReceiverManager(私信实时接收)
 login_tasks: Dict[str, dict] = {}
 # 用户手动打开的账号浏览器窗口(account_id -> BrowserContext),留引用防 GC、便于复用/清理
 open_browsers: Dict[int, Any] = {}
+credential_store: CredentialStore | None = None
+task_runtime: TaskRuntime | None = None
+wechat_mp_service: WechatMpService | None = None
+
+
+async def _runtime_wechat_check(task, payload):
+    if not wechat_mp_service:
+        raise RuntimeError("WECHAT_MP_SERVICE_UNAVAILABLE")
+    return await wechat_mp_service.check_account(int(payload["account_id"]))
+
+
+async def _runtime_wechat_articles(task, payload):
+    if not wechat_mp_service:
+        raise RuntimeError("WECHAT_MP_SERVICE_UNAVAILABLE")
+    return await wechat_mp_service.sync_articles(int(payload["account_id"]),
+                                                  count=int(payload.get("count", 20)))
+
+
+async def _runtime_wechat_metrics(task, payload):
+    if not wechat_mp_service:
+        raise RuntimeError("WECHAT_MP_SERVICE_UNAVAILABLE")
+    return await wechat_mp_service.sync_metrics(
+        int(payload["account_id"]), begin_date=str(payload["begin_date"]),
+        end_date=str(payload["end_date"]))
+
+
+async def _runtime_wechat_draft(task, payload):
+    if not wechat_mp_service:
+        raise RuntimeError("WECHAT_MP_SERVICE_UNAVAILABLE")
+    return await wechat_mp_service.create_draft(int(payload["account_id"]), payload["article"])
+
+
+async def _runtime_wechat_publish(task, payload):
+    if not wechat_mp_service:
+        raise RuntimeError("WECHAT_MP_SERVICE_UNAVAILABLE")
+    return await wechat_mp_service.publish_draft(int(payload["account_id"]),
+                                                  str(payload["media_id"]))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global browser, engine, im_receiver
+    global browser, engine, im_receiver, credential_store, task_runtime, wechat_mp_service
     init_db(cfg.db_path)
+    credential_store = CredentialStore()
+    task_runtime = TaskRuntime()
+    task_runtime.register("wechat_mp.check_account", _runtime_wechat_check)
+    task_runtime.register("wechat_mp.sync_articles", _runtime_wechat_articles)
+    task_runtime.register("wechat_mp.sync_metrics", _runtime_wechat_metrics)
+    task_runtime.register("wechat_mp.create_draft", _runtime_wechat_draft)
+    task_runtime.register("wechat_mp.publish", _runtime_wechat_publish)
+    wechat_mp_service = WechatMpService(credentials=credential_store)
+    await task_runtime.start()
     # config.yaml 里配的 proxies 导入数据库代理池(之后统一在页面管理)
     try:
         seeded = seed_proxy_pool(cfg)
@@ -85,6 +135,10 @@ async def lifespan(app: FastAPI):
     yield
     if im_receiver:
         await im_receiver.stop_all()
+    if task_runtime:
+        await task_runtime.stop()
+    if wechat_mp_service:
+        await wechat_mp_service.close()
     if engine:
         await engine.stop()
     if browser:
@@ -1580,6 +1634,264 @@ async def platform_adapter_resolve_target(platform: str, body: ResolveTargetIn):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return ref.to_dict()
+
+
+# ─────────── RP-005 凭据保险库 / RP-004 任务运行时 ───────────
+class CredentialRefIn(BaseModel):
+    platform: str
+    account_id: int | None = None
+    kind: str = "official_api"
+    secret: Dict[str, Any]
+    expires_at: str | None = None
+
+
+class CredentialRotateIn(BaseModel):
+    secret: Dict[str, Any]
+
+
+def _safe_credential_error(exc: Exception) -> HTTPException:
+    message = str(exc) or exc.__class__.__name__
+    return HTTPException(400, message if message.isupper() else "凭据操作失败")
+
+
+@app.get("/api/credential-refs")
+async def list_credential_refs(account_id: int | None = None, platform: str | None = None):
+    with get_session() as s:
+        q = select(CredentialRefRecord)
+        if account_id is not None:
+            q = q.where(CredentialRefRecord.account_id == account_id)
+        if platform:
+            q = q.where(CredentialRefRecord.platform == platform)
+        rows = s.exec(q.order_by(CredentialRefRecord.id.desc())).all()
+        return [CredentialStore.metadata(row) for row in rows]
+
+
+@app.post("/api/credential-refs")
+async def create_credential_ref(body: CredentialRefIn):
+    if credential_store is None:
+        raise HTTPException(503, "凭据服务未就绪")
+    try:
+        expires_at = datetime.fromisoformat(body.expires_at.replace("Z", "")) if body.expires_at else None
+        result = credential_store.create(platform=body.platform, account_id=body.account_id,
+                                         kind=body.kind, secret=body.secret,
+                                         expires_at=expires_at)
+        return result
+    except Exception as exc:
+        raise _safe_credential_error(exc)
+
+
+@app.post("/api/credential-refs/{ref_id}/rotate")
+async def rotate_credential_ref(ref_id: str, body: CredentialRotateIn):
+    if credential_store is None:
+        raise HTTPException(503, "凭据服务未就绪")
+    try:
+        return credential_store.rotate(ref_id, body.secret)
+    except Exception as exc:
+        raise _safe_credential_error(exc)
+
+
+@app.post("/api/credential-refs/{ref_id}/revoke")
+async def revoke_credential_ref(ref_id: str):
+    if credential_store is None:
+        raise HTTPException(503, "凭据服务未就绪")
+    try:
+        return credential_store.revoke(ref_id)
+    except Exception as exc:
+        raise _safe_credential_error(exc)
+
+
+@app.get("/api/audit-events")
+async def list_audit_events(limit: int = 100, account_id: int | None = None):
+    with get_session() as s:
+        q = select(AuditEventRecord)
+        if account_id is not None:
+            q = q.where(AuditEventRecord.account_id == account_id)
+        rows = s.exec(q.order_by(AuditEventRecord.id.desc()).limit(max(1, min(limit, 500)))).all()
+        return [{
+            "event_id": r.event_id, "occurred_at": r.occurred_at.isoformat(),
+            "action": r.action, "resource_type": r.resource_type,
+            "resource_id": r.resource_id, "result": r.result,
+            "account_id": r.account_id, "platform": r.platform,
+            "error_code": r.error_code, "approval_ref": r.approval_ref,
+            "idempotency_key": r.idempotency_key,
+            "metadata": json.loads(r.metadata_json or "{}"),
+        } for r in rows]
+
+
+@app.get("/api/runtime/tasks")
+async def list_runtime_tasks(status: str | None = None, task_type: str | None = None,
+                             account_id: int | None = None, limit: int = 100):
+    with get_session() as s:
+        q = select(RuntimeTaskRecord)
+        if status:
+            q = q.where(RuntimeTaskRecord.status == status)
+        if task_type:
+            q = q.where(RuntimeTaskRecord.task_type == task_type)
+        if account_id is not None:
+            q = q.where(RuntimeTaskRecord.account_id == account_id)
+        rows = s.exec(q.order_by(RuntimeTaskRecord.id.desc()).limit(max(1, min(limit, 500)))).all()
+        return [TaskRuntime.serialize(row) for row in rows]
+
+
+@app.post("/api/runtime/tasks/{task_id}/approve")
+async def approve_runtime_task(task_id: int):
+    if task_runtime is None:
+        raise HTTPException(503, "任务运行时未就绪")
+    try:
+        return await task_runtime.approve(task_id)
+    except Exception as exc:
+        raise _safe_credential_error(exc)
+
+
+@app.post("/api/runtime/tasks/{task_id}/run-now")
+async def run_runtime_task(task_id: int):
+    if task_runtime is None:
+        raise HTTPException(503, "任务运行时未就绪")
+    try:
+        return await task_runtime.run_task(task_id)
+    except Exception as exc:
+        raise _safe_credential_error(exc)
+
+
+@app.post("/api/runtime/tasks/{task_id}/cancel")
+async def cancel_runtime_task(task_id: int):
+    if task_runtime is None:
+        raise HTTPException(503, "任务运行时未就绪")
+    try:
+        return await task_runtime.cancel(task_id)
+    except Exception as exc:
+        raise _safe_credential_error(exc)
+
+
+class WechatAccountIn(BaseModel):
+    nickname: str = ""
+    app_id: str
+    app_secret: str
+
+
+@app.post("/api/platform-adapters/wechat_mp/accounts")
+async def create_wechat_account(body: WechatAccountIn):
+    if credential_store is None:
+        raise HTTPException(503, "凭据服务未就绪")
+    with get_session() as s:
+        account = DouyinAccount(platform="wechat_mp", account_mode="official",
+                                nickname=body.nickname.strip() or "微信公众号")
+        s.add(account); s.commit(); s.refresh(account)
+        account_id = account.id
+    try:
+        ref = credential_store.create(platform="wechat_mp", account_id=account_id,
+                                      kind="official_api",
+                                      secret={"app_id": body.app_id, "app_secret": body.app_secret})
+    except Exception as exc:
+        with get_session() as s:
+            row = s.get(DouyinAccount, account_id)
+            if row: s.delete(row); s.commit()
+        raise _safe_credential_error(exc)
+    with get_session() as s:
+        row = s.get(DouyinAccount, account_id)
+        row.credential_ref_id = ref["ref_id"]; row.status = "active"
+        s.add(row); s.commit()
+    return {"account_id": account_id, "credential": ref}
+
+
+class RuntimeEnqueueIn(BaseModel):
+    account_id: int
+    idempotency_key: str | None = None
+    run_now: bool = False
+
+
+async def _enqueue_wechat(task_type: str, body: RuntimeEnqueueIn,
+                          payload: dict[str, Any], *, requires_approval: bool = False):
+    if task_runtime is None:
+        raise HTTPException(503, "任务运行时未就绪")
+    try:
+        task = await task_runtime.enqueue(task_type=task_type, platform="wechat_mp",
+                                          account_id=body.account_id, payload=payload,
+                                          idempotency_key=body.idempotency_key,
+                                          requires_approval=requires_approval)
+        if body.run_now and task.get("status") == "pending":
+            task = await task_runtime.run_task(int(task["id"]))
+        return task
+    except Exception as exc:
+        raise _safe_credential_error(exc)
+
+
+@app.post("/api/platform-adapters/wechat_mp/accounts/check")
+async def check_wechat_account(body: RuntimeEnqueueIn):
+    return await _enqueue_wechat("wechat_mp.check_account", body,
+                                 {"account_id": body.account_id})
+
+
+class WechatFetchIn(RuntimeEnqueueIn):
+    count: int = 20
+
+
+@app.post("/api/platform-adapters/wechat_mp/contents/fetch")
+async def fetch_wechat_articles(body: WechatFetchIn):
+    return await _enqueue_wechat("wechat_mp.sync_articles", body,
+                                 {"account_id": body.account_id, "count": body.count})
+
+
+class WechatMetricsIn(RuntimeEnqueueIn):
+    begin_date: str
+    end_date: str
+
+
+@app.post("/api/platform-adapters/wechat_mp/analytics/sync")
+async def sync_wechat_analytics(body: WechatMetricsIn):
+    return await _enqueue_wechat("wechat_mp.sync_metrics", body, {
+        "account_id": body.account_id, "begin_date": body.begin_date,
+        "end_date": body.end_date,
+    })
+
+
+@app.get("/api/platform-adapters/wechat_mp/accounts/{account_id}/analytics")
+async def get_wechat_analytics(account_id: int, begin_date: str = "", end_date: str = ""):
+    with get_session() as s:
+        q = select(AccountStatSnapshot).where(
+            AccountStatSnapshot.platform == "wechat_mp",
+            AccountStatSnapshot.account_id == account_id)
+        if begin_date: q = q.where(AccountStatSnapshot.date >= begin_date)
+        if end_date: q = q.where(AccountStatSnapshot.date <= end_date)
+        rows = s.exec(q.order_by(AccountStatSnapshot.date)).all()
+        return [{"date": r.date, "followers": r.follower_count,
+                 "articles": r.aweme_count, "reads": r.total_like,
+                 "shares": r.total_comment, "favorites": r.total_play} for r in rows]
+
+
+class WechatDraftIn(RuntimeEnqueueIn):
+    article: Dict[str, Any]
+
+
+@app.post("/api/platform-adapters/wechat_mp/drafts")
+async def create_wechat_draft(body: WechatDraftIn):
+    return await _enqueue_wechat("wechat_mp.create_draft", body,
+                                 {"account_id": body.account_id, "article": body.article})
+
+
+class WechatPublishIn(RuntimeEnqueueIn):
+    media_id: str
+
+
+@app.post("/api/platform-adapters/wechat_mp/publish-tasks")
+async def publish_wechat_draft(body: WechatPublishIn):
+    return await _enqueue_wechat("wechat_mp.publish", body,
+                                 {"account_id": body.account_id, "media_id": body.media_id},
+                                 requires_approval=True)
+
+
+@app.get("/api/platform-adapters/wechat_mp/health")
+async def wechat_health(account_id: int):
+    with get_session() as s:
+        account = s.get(DouyinAccount, account_id)
+        if not account or account.platform != "wechat_mp":
+            raise HTTPException(404, "公众号账号不存在")
+        ref = s.exec(select(CredentialRefRecord).where(
+            CredentialRefRecord.ref_id == account.credential_ref_id)).first()
+        return {"account_id": account_id, "status": account.status,
+                "account_mode": account.account_mode,
+                "credential_status": ref.status if ref else "missing",
+                "credential_ref_id": ref.ref_id if ref else ""}
 
 
 @app.get("/api/settings")

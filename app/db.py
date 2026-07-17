@@ -49,4 +49,7 @@ def init_db(db_path: str):
 
 def get_session() -> Session:
     assert _engine is not None, "init_db() 未调用"
-    return Session(_engine)
+    # API/service helpers often commit and then return a sanitized DTO after
+    # leaving the session scope. Keep scalar values available without a lazy
+    # refresh that could accidentally re-read sensitive columns.
+    return Session(_engine, expire_on_commit=False)

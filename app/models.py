@@ -11,6 +11,8 @@ class DouyinAccount(SQLModel, table=True):
     """登录得到的平台账号(浏览器会话持有者)。表名沿用历史,实际承载多平台账号。"""
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str = Field(default="douyin", index=True)  # douyin | xhs
+    account_mode: str = "restricted"  # restricted | official (公众号)
+    credential_ref_id: str = ""        # CredentialRef metadata only
     nickname: str = ""
     sec_uid: str = ""              # 抖音 sec_uid / 小红书 user_id
     uid: str = ""                  # 抖音数字 uid(= IM device_id,用于 frontier-im WS 接收)
@@ -342,3 +344,129 @@ class AccountActionTask(SQLModel, table=True):
     min_gap_seconds: int = 60      # 同账号两次写操作最小间隔
     created_at: datetime = Field(default_factory=datetime.utcnow)
     done_at: Optional[datetime] = None
+
+
+class CredentialRefRecord(SQLModel, table=True):
+    """Non-secret credential metadata; usable values live in versions."""
+    __tablename__ = "credential_refs"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ref_id: str = Field(index=True, unique=True)
+    platform: str = Field(index=True)
+    account_id: Optional[int] = Field(default=None, index=True)
+    kind: str = Field(index=True)  # official_api | browser_state | creator_state | proxy
+    status: str = Field(default="active", index=True)
+    active_version: int = 1
+    fingerprint: str = ""
+    expires_at: Optional[datetime] = None
+    last_checked_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CredentialVersionRecord(SQLModel, table=True):
+    """Envelope-encrypted credential payload; never serialized to API output."""
+    __tablename__ = "credential_versions"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ref_id: str = Field(index=True)
+    version: int = Field(index=True)
+    encrypted_data_key: str = ""
+    ciphertext: str = ""
+    nonce: str = ""
+    key_provider: str = ""
+    key_id: str = ""
+    algorithm: str = "AES-256-GCM"
+    rotated_from_version: Optional[int] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AuditEventRecord(SQLModel, table=True):
+    """Append-only, hash-chained security and write-operation evidence."""
+    __tablename__ = "adapter_audit_events"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    event_id: str = Field(index=True, unique=True)
+    occurred_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    action: str = Field(index=True)
+    resource_type: str = ""
+    resource_id: str = ""
+    result: str = ""
+    actor_id: str = ""
+    account_id: Optional[int] = Field(default=None, index=True)
+    platform: str = Field(default="", index=True)
+    request_id: str = ""
+    trace_id: str = ""
+    error_code: str = ""
+    approval_ref: str = ""
+    idempotency_key: str = ""
+    metadata_json: str = "{}"
+    previous_event_hash: str = ""
+    event_hash: str = ""
+
+
+class WriteApprovalRecord(SQLModel, table=True):
+    """Human approval attached to a platform write task."""
+    __tablename__ = "write_approvals"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    approval_ref: str = Field(index=True, unique=True)
+    task_type: str = Field(index=True)
+    account_id: Optional[int] = Field(default=None, index=True)
+    status: str = Field(default="pending", index=True)  # pending | approved | rejected | expired
+    actor_id: str = ""
+    expires_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    decided_at: Optional[datetime] = None
+
+
+class WriteIdempotencyRecord(SQLModel, table=True):
+    """One durable result per account/operation/idempotency key."""
+    __tablename__ = "write_idempotency_records"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    account_id: Optional[int] = Field(default=None, index=True)
+    operation: str = Field(index=True)
+    idempotency_key: str = Field(index=True)
+    task_id: Optional[int] = None
+    result_json: str = "{}"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class RuntimeTaskRecord(SQLModel, table=True):
+    """Durable generic task state used by the RP-004 runtime."""
+    __tablename__ = "runtime_tasks"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_type: str = Field(index=True)
+    platform: str = Field(default="", index=True)
+    account_id: Optional[int] = Field(default=None, index=True)
+    payload_json: str = "{}"
+    status: str = Field(default="pending", index=True)
+    idempotency_key: str = Field(default="", index=True)
+    approval_ref: str = ""
+    max_attempts: int = 3
+    attempts: int = 0
+    min_gap_seconds: int = 0
+    requires_approval: bool = False
+    scheduled_at: Optional[datetime] = Field(default=None, index=True)
+    next_run_at: Optional[datetime] = Field(default=None, index=True)
+    locked_at: Optional[datetime] = None
+    result_json: str = "{}"
+    error: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    finished_at: Optional[datetime] = None
+
+
+class PlatformMetricSnapshot(SQLModel, table=True):
+    """Unified daily metric row for account or individual content."""
+    __tablename__ = "platform_metric_snapshots"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(index=True)
+    account_id: int = Field(index=True)
+    content_id: str = Field(default="", index=True)
+    metric_date: str = Field(index=True)
+    reads: int = 0
+    likes: int = 0
+    comments: int = 0
+    shares: int = 0
+    favorites: int = 0
+    new_users: int = 0
+    canceled_users: int = 0
+    raw_json: str = "{}"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
